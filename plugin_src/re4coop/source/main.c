@@ -7,11 +7,11 @@
 attr_public const char *g_pluginName = "re4coop";
 attr_public const char *g_pluginDesc = "RE4 coop - reconocimiento";
 attr_public const char *g_pluginAuth = "re4coop";
-attr_public uint32_t g_pluginVersion = 0x00000108; // 1.08
+attr_public uint32_t g_pluginVersion = 0x00000109; // 1.09
 
 // Version en texto: sale en CADA mensaje de pantalla y en la cabecera de los logs.
 // Ojo: si cambias la version, cambia tambien el numero de arriba. Nada mas.
-#define RE4COOP_VER_STR "1.08"
+#define RE4COOP_VER_STR "1.09"
 
 // Archivos de salida: los copias de la PS4 a la PC y me los pasas.
 #ifndef RE4COOP_LOG_PATH
@@ -858,88 +858,62 @@ static void re4_log_parts(uintptr_t parts, const char *label) {
     LOGF("\n");
 }
 
-// Salto grande y deslizamiento.
-// La v1.07 escribio 1000 y no se noto nada porque caminando Leon avanza ~1600 unidades
-// por segundo: 1000 unidades son metro y medio, no los 10 m que suponia yo. Ahora el
-// salto es de 20000 (unos 30 m) y ademas se desliza en varios pasos de un segundo.
-#define RE4COOP_JUMP  20000.0f
-#define RE4COOP_GLIDE 12000.0f
-#define RE4COOP_GLIDE_STEPS 4
+// Andar de verdad: en vez de un salto, mover a Leon un poquito muchas veces por
+// segundo. Con 20 pasos por segundo y 1600 unidades/s (lo que avanza caminando) cada
+// paso son 80 unidades, y en pantalla se ve como si anduviera el solo.
+#define RE4COOP_WALK_HZ     20        // pasos por segundo
+#define RE4COOP_WALK_SPEED  1600.0f   // unidades por segundo (andar normal)
+#define RE4COOP_WALK_SECS   10        // segundos andando en cada sentido
 
-static void re4_write_test(uintptr_t obj, const BestMove *b, const char *tag, uintptr_t parts) {
+// La espera entre pasos tiene que ser de milisegundos, y sceKernelSleep solo cuenta
+// segundos enteros: por eso este otro, del mismo libkernel.
+extern int re4_usleep(unsigned int useconds) __asm__("sceKernelUsleep");
+
+static void re4_walk(uintptr_t obj, int off, uintptr_t parts, const char *tag, int dir, int step_no) {
+    float step = (RE4COOP_WALK_SPEED / (float)RE4COOP_WALK_HZ) * (float)dir;
+    int steps = RE4COOP_WALK_HZ * RE4COOP_WALK_SECS;
     char msg[200];
-    snprintf(msg, sizeof(msg), "prueba %s (+0x%x): suelta el mando y mira a Leon", tag, b->off);
-    notify_step(10, msg);
+    snprintf(msg, sizeof(msg), "andando %s %d s: suelta el mando y mira a Leon", tag, RE4COOP_WALK_SECS);
+    notify_step(step_no, msg);
     re4_sleep(3);   // margen: los avisos de pantalla salen con retraso
 
-    uint32_t cur = re4_field_bits(obj, b->off);
-    LOGF("\n== PRUEBA DE ESCRITURA %s: campo +0x%x ==\n", tag, b->off);
-    re4_log_float("al_caminar", b->before);
-    re4_log_float("despues", b->after);
-    re4_log_float("leido_ahora", re4_bits_to_float(cur));
-    LOGF("voy a sumar 20000.0 (unos 30 m) a ese valor y a sus copias\n");
+    LOGF("\n== ANDAR %s: campo +0x%x, %d pasos de %.1f unidades ==\n",
+         tag, off, steps, step);
+    re4_log_float("inicio", re4_bits_to_float(re4_field_bits(obj, off)));
     if (parts) {
-        re4_log_parts(parts, "antes");
+        re4_log_parts(parts, "inicio");
     }
     log_flush();
 
-    int hits = re4_patch_delta(obj, cur, RE4COOP_JUMP);
-    LOGF("campos escritos: %d\n", hits);
-    for (int i = 0; i < g_pat_n; i++) {
-        LOGF("   escrito +0x%x\n", g_pat[i].off);
+    uint32_t start_bits = re4_field_bits(obj, off);
+    float start = re4_bits_to_float(start_bits);
+    int misses = 0;
+    for (int i = 0; i < steps; i++) {
+        uint32_t cur = re4_field_bits(obj, off);
+        int hits = re4_patch_delta(obj, cur, step);
+        g_pat_n = 0;
+        if (hits == 0) {
+            misses++;   // el valor ya no estaba donde creiamos: el juego lo cambio
+        }
+        if ((i + 1) % RE4COOP_WALK_HZ == 0) {
+            float now = re4_bits_to_float(re4_field_bits(obj, off));
+            float real = now - start;
+            float want = step * (float)(i + 1);
+            LOGF("   t=%ds real=%.1f esperado=%.1f desvio=%.1f pasos_sin_copias=%d\n",
+                 (i + 1) / RE4COOP_WALK_HZ, real, want, real - want, misses);
+            if (parts) {
+                re4_log_parts(parts, "ahora");
+            }
+            log_flush();
+        }
+        re4_usleep(1000000u / (unsigned int)RE4COOP_WALK_HZ);
     }
-    g_pat_n = 0;   // la vuelta se hace sumando -20000 al valor de ahora
-    re4_log_float("tras_escribir", re4_bits_to_float(re4_field_bits(obj, b->off)));
-    log_flush();
-
-    re4_sleep(2);
-    re4_log_float("tras_2s", re4_bits_to_float(re4_field_bits(obj, b->off)));
-    if (parts) {
-        re4_log_parts(parts, "tras_2s");
-    }
-    log_flush();
-    re4_sleep(2);
-    re4_log_float("tras_4s", re4_bits_to_float(re4_field_bits(obj, b->off)));
-    if (parts) {
-        re4_log_parts(parts, "tras_4s");
-    }
+    re4_log_float("final", re4_bits_to_float(re4_field_bits(obj, off)));
     LOGF("\n");
     log_flush();
-
-    notify_step(11, "te devuelvo al sitio de antes...");
-    re4_patch_delta(obj, re4_field_bits(obj, b->off), -RE4COOP_JUMP);
-    g_pat_n = 0;
-    re4_log_float("restaurado", re4_bits_to_float(re4_field_bits(obj, b->off)));
-    log_flush();
-    re4_sleep(2);
-}
-
-// Deslizar: empujar la posicion en varios pasos de un segundo, en vez de un salto.
-// Es el primer ensayo de mover a Leon desde el codigo del plugin.
-static void re4_glide(uintptr_t obj, int off, uintptr_t parts) {
-    notify_step(12, "prueba C: deslizando a Leon 4 s. No toques el mando");
-    LOGF("\n== PRUEBA C: deslizar +0x%x en %d pasos de %d unidades ==\n",
-         off, RE4COOP_GLIDE_STEPS, (int)(RE4COOP_GLIDE / (float)RE4COOP_GLIDE_STEPS));
-    re4_log_float("inicio", re4_bits_to_float(re4_field_bits(obj, off)));
-    log_flush();
-    for (int i = 0; i < RE4COOP_GLIDE_STEPS; i++) {
-        uint32_t cur = re4_field_bits(obj, off);
-        int hits = re4_patch_delta(obj, cur, RE4COOP_GLIDE / (float)RE4COOP_GLIDE_STEPS);
-        g_pat_n = 0;
-        LOGF("paso %d: copias=%d", i + 1, hits);
-        re4_log_float("ahora", re4_bits_to_float(re4_field_bits(obj, off)));
-        LOGF("\n");
-        if (parts) {
-            re4_log_parts(parts, "ahora");
-        }
-        log_flush();
-        if (i + 1 < RE4COOP_GLIDE_STEPS) {
-            re4_sleep(1);
-        }
-    }
     re4_sleep(1);
-    notify_step(13, "fin: mira donde quedo Leon. Copia re4coop_scan.txt");
 }
+
    // "foto" de los objetos
 
 static int re4_det_want(const char *nm) {
@@ -1191,11 +1165,9 @@ static void *re4_scan_thread(void *arg) {
         parts = re4_find_parts(leon_obj, best.off);
         LOGF("\n== cParts (el nodo que se dibuja): 0x%llx ==\n", (unsigned long long)parts);
         log_flush();
-        re4_write_test(leon_obj, &best, "A", parts);
-        if (second.valid && second.off != best.off) {
-            re4_write_test(leon_obj, &second, "B", parts);
-        }
-        re4_glide(leon_obj, best.off, parts);
+        re4_walk(leon_obj, best.off, parts, "hacia delante", +1, 10);
+        re4_walk(leon_obj, best.off, parts, "hacia atras", -1, 12);
+        notify_step(13, "fin: mira donde quedo Leon y copia re4coop_scan.txt");
     } else {
         notify_step(10, "sin candidato claro: no escribo nada, solo queda el volcado");
         re4_sleep(2);
