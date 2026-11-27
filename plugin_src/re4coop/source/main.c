@@ -7,11 +7,24 @@
 attr_public const char *g_pluginName = "re4coop";
 attr_public const char *g_pluginDesc = "RE4 coop - reconocimiento";
 attr_public const char *g_pluginAuth = "re4coop";
-attr_public uint32_t g_pluginVersion = 0x00000102; // 1.02
+attr_public uint32_t g_pluginVersion = 0x00000105; // 1.05
 
-// Archivo de log: lo copias de la PS4 a la PC y me lo pasas.
+// Version en texto: sale en CADA mensaje de pantalla y en la cabecera de los logs.
+// Ojo: si cambias la version, cambia tambien el numero de arriba. Nada mas.
+#define RE4COOP_VER_STR "1.05"
+
+// Archivos de salida: los copias de la PS4 a la PC y me los pasas.
 #ifndef RE4COOP_LOG_PATH
-#define RE4COOP_LOG_PATH "/data/GoldHEN/re4coop_log.txt"
+#define RE4COOP_LOG_PATH "/data/GoldHEN/re4coop_log.txt"      // lista de clases (al abrir el juego)
+#endif
+#ifndef RE4COOP_SCAN_PATH
+#define RE4COOP_SCAN_PATH "/data/GoldHEN/re4coop_scan.txt"    // objetos en vivo (ya jugando)
+#endif
+#ifndef RE4COOP_PROBE_PATH
+#define RE4COOP_PROBE_PATH "/data/GoldHEN/re4coop_probe.tmp"  // archivo auxiliar, se puede borrar
+#endif
+#ifndef RE4COOP_FIRST_SCAN_SECS
+#define RE4COOP_FIRST_SCAN_SECS 150                           // espera antes del primer escaneo
 #endif
 
 // Identifica esta compilacion (fecha y hora en que GitHub la hizo).
@@ -22,9 +35,12 @@ attr_public uint32_t g_pluginVersion = 0x00000102; // 1.02
 // el mismo simbolo, para no depender de que un header las declare.
 extern int  re4_open(const char *path, int flags, int mode) __asm__("sceKernelOpen");
 extern long re4_write(int fd, const void *buf, unsigned long nbyte) __asm__("sceKernelWrite");
+extern long re4_pwrite(int fd, const void *buf, unsigned long nbyte, long offset) __asm__("sceKernelPwrite");
 extern int  re4_close(int fd) __asm__("sceKernelClose");
 extern int  re4_module_list(int *array, unsigned long max, unsigned long *count) __asm__("sceKernelGetModuleList");
 extern int  re4_module_info(int handle, void *info) __asm__("sceKernelGetModuleInfo");
+extern int  re4_thread_create(void **thread, const void *attr, void *(*entry)(void *), void *arg, const char *name) __asm__("scePthreadCreate");
+extern unsigned int re4_sleep(unsigned int seconds) __asm__("sceKernelSleep");
 
 #define RE4_O_WRONLY 0x0001
 #define RE4_O_CREAT  0x0200
@@ -62,6 +78,20 @@ static void log_flush(void) {
     g_len = 0;
 }
 
+static void log_open(const char *path) {
+    g_len = 0;
+    g_total = 0;
+    g_fd = re4_open(path, RE4_O_WRONLY | RE4_O_CREAT | RE4_O_TRUNC, 0777);
+}
+
+static void log_close(void) {
+    log_flush();
+    if (g_fd >= 0) {
+        re4_close(g_fd);
+    }
+    g_fd = -1;
+}
+
 static void log_raw(const char *s, size_t n) {
     if (n > sizeof(g_buf)) {
         n = sizeof(g_buf);
@@ -89,27 +119,36 @@ static void log_raw(const char *s, size_t n) {
 // Mensajes numerados en pantalla: el ultimo numero que veas es hasta donde llego.
 static void notify_step(int step, const char *text) {
     char msg[200] = {0};
-    snprintf(msg, sizeof(msg), "re4coop %d: %s", step, text);
+    snprintf(msg, sizeof(msg), "re4coop v" RE4COOP_VER_STR " #%d: %s", step, text);
     NotifyStatic(TEX_ICON_SYSTEM, msg);
 }
 
 // ---------------------------------------------------------------- datos del escaneo
 
 #define MAX_NAMES 4096
-#define MAX_VT    8192
-#define MAX_INT   64
-#define MAX_REFS  6
+#define MAX_CEN   3072
+#define MAX_REFS  3
 
-typedef struct { uintptr_t addr; int len; } NameEnt;           // texto del nombre de clase
-typedef struct { uintptr_t addr; int name; } TinfoEnt;         // typeinfo -> indice del nombre
-typedef struct { uintptr_t addr; int tinfo; int nfuncs; } VtEnt; // vtable -> indice del typeinfo
+typedef struct { uintptr_t addr; int len; } NameEnt;      // texto del nombre de clase
+typedef struct { uintptr_t addr; int name; } TinfoEnt;    // typeinfo -> indice del nombre
+
+// Una "vtable" = tabla de funciones virtuales de una clase. Cada objeto de esa clase
+// guarda en su primer campo la direccion de su vtable.
+typedef struct {
+    uintptr_t addr;           // direccion de la vtable (la que guardan los objetos)
+    int nf;                   // cuantas funciones seguidas apuntan al codigo del juego
+    int name;                 // indice en g_names, o -1 si el juego no trae el nombre
+    uint64_t f[4];            // primeras funciones
+    int nrefs;
+    uintptr_t refs[MAX_REFS]; // sitios del codigo que la usan (constructores probables)
+} CenEnt;
 
 static NameEnt g_names[MAX_NAMES];
 static int g_nnames;
 static TinfoEnt g_ti[MAX_NAMES];
 static int g_nti;
-static VtEnt g_vt[MAX_VT];
-static int g_nvt;
+static CenEnt g_cen[MAX_CEN];
+static int g_ncen;
 
 typedef struct { const unsigned char *p; size_t n; int prot; } Seg;
 static Seg g_seg[4];          // segmentos legibles del juego, ordenados por direccion
@@ -117,14 +156,6 @@ static int g_nseg;
 static uintptr_t g_base;      // direccion del primer segmento (normalmente 0x400000)
 static uintptr_t g_code_lo;   // rango de codigo (segmentos ejecutables)
 static uintptr_t g_code_hi;
-
-static int g_int_vt[MAX_INT];                 // vtables de clases de interes
-static int g_nint;
-static uintptr_t g_refs[MAX_INT][MAX_REFS];   // sitios del codigo que usan esa vtable
-static int g_nrefs[MAX_INT];
-
-static const char *const g_interest[] = { "Player", "Camera", "Cam", "Ashley", "Pad", "Leon" };
-#define N_INTEREST ((int)(sizeof(g_interest) / sizeof(g_interest[0])))
 
 // ---------------------------------------------------------------- utilidades
 
@@ -162,6 +193,38 @@ static uint64_t re4_rd64(const unsigned char *p) {
 static int32_t re4_rd32(const unsigned char *p) {
     uint32_t v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
     return (int32_t)v;
+}
+
+static int re4_in_code(uint64_t v) {
+    return v >= g_code_lo && v < g_code_hi;
+}
+
+static int re4_in_module(uint64_t v) {
+    for (int s = 0; s < g_nseg; s++) {
+        uint64_t lo = (uint64_t)(uintptr_t)g_seg[s].p;
+        if (v >= lo && v < lo + g_seg[s].n) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Un float se escribe sin usar printf de coma flotante (algunos libc de PS4 no lo traen).
+static float re4_bits_to_float(uint32_t b) {
+    union { uint32_t u; float f; } x;
+    x.u = b;
+    return x.f;
+}
+
+static void re4_log_float(const char *label, float f) {
+    if (!(f > -1000000.0f && f < 1000000.0f)) {
+        LOGF(" %s=?", label);
+        return;
+    }
+    int neg = (f < 0.0f);
+    float af = neg ? -f : f;
+    int v = (int)(af * 100.0f + 0.5f);
+    LOGF(" %s=%s%d.%02d", label, neg ? "-" : "", v / 100, v % 100);
 }
 
 // Nombre "mangleado" de clase, como 7cPlayer o N3mtl7CObjectE.
@@ -253,7 +316,31 @@ static int re4_find_ti(uintptr_t v) {
     return -1;
 }
 
-// ---------------------------------------------------------------- escaneo del juego
+static int re4_find_cen(uint64_t v) {
+    int lo = 0;
+    int hi = g_ncen - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (g_cen[mid].addr == v) {
+            return mid;
+        }
+        if (g_cen[mid].addr < v) {
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return -1;
+}
+
+static const char *re4_cen_name(int ci) {
+    if (g_cen[ci].name >= 0) {
+        return (const char *)g_names[g_cen[ci].name].addr;
+    }
+    return "?";
+}
+
+// ---------------------------------------------------------------- escaneo estatico (al abrir el juego)
 
 // Paso 1: nombres de clase (texto) dentro del juego.
 static void re4_collect_names(void) {
@@ -321,70 +408,63 @@ static void re4_collect_typeinfos(void) {
     }
 }
 
-// Paso 3: "vtable" = tabla de funciones virtuales; justo antes de ella hay un puntero al typeinfo.
-static void re4_collect_vtables(void) {
-    g_nvt = 0;
-    if (g_nti == 0) {
-        return;
-    }
-    uintptr_t lo = g_ti[0].addr;
-    uintptr_t hi = g_ti[g_nti - 1].addr;
+// Paso 3: censo de TODAS las vtables, tengan nombre o no. Una vtable es una tira de
+// punteros al codigo del juego, precedida de [offset_to_top = 0] y [typeinfo o 0].
+static void re4_collect_census(void) {
+    g_ncen = 0;
     for (int s = 0; s < g_nseg; s++) {
+        if (g_seg[s].prot & 4) {
+            continue;   // el codigo no guarda vtables
+        }
         const unsigned char *b = g_seg[s].p;
         size_t n = g_seg[s].n;
-        for (size_t off = 8; off + 16 <= n; off += 8) {
-            uint64_t v = re4_rd64(b + off);
-            if (v < lo || v > hi) {
+        for (size_t off = 16; off + 16 <= n; off += 8) {
+            uint64_t f0 = re4_rd64(b + off);
+            if (!re4_in_code(f0)) {
                 continue;
             }
-            int idx = re4_find_ti((uintptr_t)v);
-            if (idx < 0) {
+            uint64_t f1 = re4_rd64(b + off + 8);
+            if (!re4_in_code(f1)) {
+                continue;
+            }
+            uint64_t prev = re4_rd64(b + off - 8);
+            if (re4_in_code(prev)) {
+                continue;   // no es el inicio de la tira
+            }
+            uint64_t ott = re4_rd64(b + off - 16);
+            if (!(ott == 0 || ((int64_t)ott < 0 && (int64_t)ott > -0x10000))) {
+                continue;
+            }
+            if (prev != 0 && !re4_in_module(prev)) {
                 continue;
             }
             int nf = 0;
-            while (nf < 256 && off + 8 + (size_t)(nf + 1) * 8 <= n) {
-                uint64_t f = re4_rd64(b + off + 8 + (size_t)nf * 8);
-                if (f < g_code_lo || f >= g_code_hi) {
-                    break;
-                }
+            while (nf < 256 && off + (size_t)(nf + 1) * 8 <= n && re4_in_code(re4_rd64(b + off + (size_t)nf * 8))) {
                 nf++;
             }
-            if (nf == 0) {
-                continue;   // no es una vtable (por ejemplo, la referencia de una clase hija a su base)
-            }
-            if (g_nvt >= MAX_VT) {
+            if (g_ncen >= MAX_CEN) {
                 return;
             }
-            g_vt[g_nvt].addr = (uintptr_t)(b + off + 8);
-            g_vt[g_nvt].tinfo = idx;
-            g_vt[g_nvt].nfuncs = nf;
-            g_nvt++;
+            CenEnt *c = &g_cen[g_ncen++];
+            c->addr = (uintptr_t)(b + off);
+            c->nf = nf;
+            c->name = -1;
+            int ti = re4_find_ti((uintptr_t)prev);
+            if (ti >= 0) {
+                c->name = g_ti[ti].name;
+            }
+            for (int k = 0; k < 4; k++) {
+                c->f[k] = (k < nf) ? re4_rd64(b + off + (size_t)k * 8) : 0;
+            }
+            c->nrefs = 0;
         }
     }
 }
 
-static int re4_is_interest(const char *name) {
-    for (int i = 0; i < N_INTEREST; i++) {
-        if (re4_contains(name, g_interest[i])) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-// Paso 4: en el codigo, buscar instrucciones "lea reg, [rip+X]" que apuntan a esas vtables.
+// Paso 4: en el codigo, buscar instrucciones "lea reg, [rip+X]" que apuntan a una vtable.
 // Quien guarda una vtable en un objeto casi siempre es su constructor.
 static void re4_find_code_refs(void) {
-    g_nint = 0;
-    for (int i = 0; i < g_nvt && g_nint < MAX_INT; i++) {
-        const char *nm = (const char *)g_names[g_ti[g_vt[i].tinfo].name].addr;
-        if (re4_is_interest(nm)) {
-            g_int_vt[g_nint] = i;
-            g_nrefs[g_nint] = 0;
-            g_nint++;
-        }
-    }
-    if (g_nint == 0) {
+    if (g_ncen == 0) {
         return;
     }
     for (int s = 0; s < g_nseg; s++) {
@@ -398,11 +478,12 @@ static void re4_find_code_refs(void) {
                 continue;
             }
             uintptr_t target = (uintptr_t)(b + off + 7) + (intptr_t)re4_rd32(b + off + 3);
-            for (int j = 0; j < g_nint; j++) {
-                uintptr_t v = g_vt[g_int_vt[j]].addr;
-                if ((target == v || target == v - 16) && g_nrefs[j] < MAX_REFS) {
-                    g_refs[j][g_nrefs[j]++] = (uintptr_t)(b + off);
-                }
+            int ci = re4_find_cen(target);
+            if (ci < 0) {
+                ci = re4_find_cen(target + 16);   // a veces apuntan al inicio del bloque (vtable - 16)
+            }
+            if (ci >= 0 && g_cen[ci].nrefs < MAX_REFS) {
+                g_cen[ci].refs[g_cen[ci].nrefs++] = (uintptr_t)(b + off);
             }
         }
     }
@@ -450,33 +531,295 @@ static int re4_load_segments(const Re4ModuleInfo *mi) {
     return g_nseg;
 }
 
-// ---------------------------------------------------------------- escribir resultados
-
-static void re4_write_report(void) {
-    LOGF("== resumen ==\nnombres de clase=%d typeinfos=%d vtables=%d clases de interes=%d\n",
-         g_nnames, g_nti, g_nvt, g_nint);
-
-    LOGF("== clases (nombre | vtable | funciones virtuales) ==\n");
-    for (int i = 0; i < g_nvt; i++) {
-        const char *nm = (const char *)g_names[g_ti[g_vt[i].tinfo].name].addr;
-        LOGF("%s | 0x%llx | %d\n", nm, (unsigned long long)g_vt[i].addr, g_vt[i].nfuncs);
-    }
-
-    LOGF("== clases de interes: funciones virtuales (desplazamiento desde la base 0x%llx) y codigo que usa la vtable ==\n",
-         (unsigned long long)g_base);
-    for (int j = 0; j < g_nint; j++) {
-        const VtEnt *v = &g_vt[g_int_vt[j]];
-        const char *nm = (const char *)g_names[g_ti[v->tinfo].name].addr;
-        LOGF("%s vtable=0x%llx nfuncs=%d\n", nm, (unsigned long long)v->addr, v->nfuncs);
-        int shown = v->nfuncs < 48 ? v->nfuncs : 48;
-        for (int k = 0; k < shown; k++) {
-            uint64_t f = re4_rd64((const unsigned char *)v->addr + (size_t)k * 8);
-            LOGF("  f%d=+0x%llx\n", k, (unsigned long long)(f - g_base));
-        }
-        for (int k = 0; k < g_nrefs[j]; k++) {
-            LOGF("  usa_vtable_en=+0x%llx\n", (unsigned long long)(g_refs[j][k] - g_base));
+static void re4_write_static_report(void) {
+    int named = 0;
+    for (int i = 0; i < g_ncen; i++) {
+        if (g_cen[i].name >= 0) {
+            named++;
         }
     }
+    LOGF("== resumen ==\nnombres=%d typeinfos=%d vtables=%d (con nombre=%d, sin nombre=%d)\n",
+         g_nnames, g_nti, g_ncen, named, g_ncen - named);
+    LOGF("(funciones y codigo = desplazamiento desde la base 0x%llx)\n", (unsigned long long)g_base);
+
+    LOGF("== vtables SIN nombre: vtable | n | f0 f1 f2 f3 | codigo que la usa ==\n");
+    for (int i = 0; i < g_ncen; i++) {
+        const CenEnt *c = &g_cen[i];
+        if (c->name >= 0) {
+            continue;
+        }
+        LOGF("0x%llx | %d |", (unsigned long long)c->addr, c->nf);
+        for (int k = 0; k < 4 && k < c->nf; k++) {
+            LOGF(" +0x%llx", (unsigned long long)(c->f[k] - g_base));
+        }
+        LOGF(" |");
+        for (int k = 0; k < c->nrefs; k++) {
+            LOGF(" +0x%llx", (unsigned long long)(c->refs[k] - g_base));
+        }
+        LOGF("\n");
+    }
+
+    LOGF("== vtables CON nombre: nombre | vtable | n | codigo que la usa ==\n");
+    for (int i = 0; i < g_ncen; i++) {
+        const CenEnt *c = &g_cen[i];
+        if (c->name < 0) {
+            continue;
+        }
+        LOGF("%s | 0x%llx | %d |", re4_cen_name(i), (unsigned long long)c->addr, c->nf);
+        for (int k = 0; k < c->nrefs; k++) {
+            LOGF(" +0x%llx", (unsigned long long)(c->refs[k] - g_base));
+        }
+        LOGF("\n");
+    }
+}
+
+// ---------------------------------------------------------------- escaneo en vivo (ya jugando)
+
+static int g_probe_fd = -1;
+
+// Comprueba sin riesgo de que se caiga el juego si se pueden leer n bytes en esa direccion:
+// el sistema intenta copiarlos a un archivo y avisa con un error si no estan mapeados.
+static int re4_readable(uint64_t addr, size_t n) {
+    if (g_probe_fd < 0) {
+        return 0;
+    }
+    long w = re4_pwrite(g_probe_fd, (const void *)(uintptr_t)addr, (unsigned long)n, 0);
+    return w == (long)n;
+}
+
+// ---- deteccion por movimiento: quien se mueve cuando tu te mueves, ese es Leon ----
+//
+// No hace falta saber como se llama la clase. Se guarda una foto de los primeros bytes
+// de cada objeto vivo, se te pide que camines, y se compara: los objetos que cambiaron
+// son los que se mueven (Leon, su camara, los enemigos cercanos). Con una segunda fase
+// (girar la camara sin caminar) se separa la camara del personaje.
+
+#define DET_MAX        640
+#define DET_BYTES      0x100
+#define DET_WORDS      (DET_BYTES / 8)
+#define DET_MAX_PRINT  64      // objetos distintos que se detallan en el archivo
+#define DET_WORDS_PRINT 12     // palabras (8 bytes) que se detallan por objeto
+
+typedef struct {
+    uintptr_t slot;   // direccion global que guarda el puntero al objeto
+    uintptr_t obj;    // el objeto
+    uintptr_t vt;     // su vtable
+    int name;         // indice en g_names, o -1
+    int nf;
+} DetEnt;
+
+static DetEnt g_det[DET_MAX];
+static int g_ndet;
+static unsigned char g_img[DET_MAX * DET_BYTES];   // "foto" de los objetos
+
+static int re4_det_want(const char *nm) {
+    return re4_contains(nm, "cPl") || re4_contains(nm, "Player") ||
+           re4_contains(nm, "Camera") || re4_contains(nm, "cSub") ||
+           re4_contains(nm, "cCtrl") || re4_contains(nm, "Enemy") ||
+           re4_contains(nm, "Chara") || re4_contains(nm, "Pl0");
+}
+
+// Recorre la memoria de datos del juego y guarda los objetos vivos (primero los de
+// clases que suenan interesantes, para que no se llenen los huecos con basura).
+static void re4_det_collect(void) {
+    g_ndet = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int s = 0; s < g_nseg; s++) {
+            if (!(g_seg[s].prot & 2) || (g_seg[s].prot & 4)) {
+                continue;   // solo memoria de datos escribible
+            }
+            const unsigned char *b = g_seg[s].p;
+            size_t n = g_seg[s].n;
+            for (size_t off = 0; off + 8 <= n; off += 8) {
+                if (g_ndet >= DET_MAX) {
+                    return;
+                }
+                uint64_t v = re4_rd64(b + off);
+                if (v == 0 || re4_in_code(v)) {
+                    continue;
+                }
+                int ci = re4_find_cen(v);
+                uint64_t obj = 0;
+                uint64_t vt = 0;
+                if (ci >= 0) {
+                    // el campo es directamente una vtable: objeto incrustado en los datos
+                    obj = (uint64_t)(uintptr_t)(b + off);
+                    vt = v;
+                } else {
+                    if ((v & 7) != 0 || v >= 0x0000800000000000ULL) {
+                        continue;
+                    }
+                    if (!re4_in_module(v) && v < 0x100000000ULL) {
+                        continue;
+                    }
+                    if (!re4_in_module(v) && !re4_readable(v, 8)) {
+                        continue;
+                    }
+                    uint64_t q = re4_rd64((const unsigned char *)(uintptr_t)v);
+                    ci = re4_find_cen(q);
+                    if (ci < 0) {
+                        continue;
+                    }
+                    obj = v;
+                    vt = q;
+                }
+                int want = (g_cen[ci].name >= 0) && re4_det_want(re4_cen_name(ci));
+                if (pass == 0 && !want) {
+                    continue;
+                }
+                if (pass == 1 && want) {
+                    continue;   // ya se guardo en la primera pasada
+                }
+                if (!re4_readable(obj, DET_BYTES)) {
+                    continue;
+                }
+                DetEnt *d = &g_det[g_ndet];
+                d->slot = (uintptr_t)(b + off);
+                d->obj = (uintptr_t)obj;
+                d->vt = (uintptr_t)vt;
+                d->name = g_cen[ci].name;
+                d->nf = g_cen[ci].nf;
+                const unsigned char *p = (const unsigned char *)(uintptr_t)obj;
+                unsigned char *img = &g_img[(size_t)g_ndet * DET_BYTES];
+                for (int k = 0; k < DET_BYTES; k++) {
+                    img[k] = p[k];
+                }
+                g_ndet++;
+            }
+        }
+    }
+}
+
+static void re4_det_list(void) {
+    LOGF("== candidatos guardados: %d ==\n", g_ndet);
+    for (int i = 0; i < g_ndet; i++) {
+        const DetEnt *d = &g_det[i];
+        LOGF("C%03d slot=0x%llx obj=0x%llx vt=0x%llx n=%d %s\n",
+             i, (unsigned long long)d->slot, (unsigned long long)d->obj,
+             (unsigned long long)d->vt, d->nf,
+             d->name >= 0 ? (const char *)g_names[d->name].addr : "?");
+    }
+}
+
+// Compara la foto guardada con la memoria actual y escribe que objetos cambiaron.
+static int re4_det_report(const char *label) {
+    unsigned char now[DET_BYTES];
+    int moved = 0;
+    int printed = 0;
+    int truncated = 0;
+
+    LOGF("\n== %s ==\n", label);
+    for (int i = 0; i < g_ndet; i++) {
+        DetEnt *d = &g_det[i];
+        unsigned char *img = &g_img[(size_t)i * DET_BYTES];
+
+        if (!re4_readable((uint64_t)d->obj, DET_BYTES)) {
+            LOGF("GONE obj=0x%llx (ya no se puede leer)\n", (unsigned long long)d->obj);
+            continue;
+        }
+        const unsigned char *p = (const unsigned char *)(uintptr_t)d->obj;
+        for (int k = 0; k < DET_BYTES; k++) {
+            now[k] = p[k];
+        }
+
+        int ch = 0;
+        int first = -1;
+        int last = -1;
+        for (int w = 0; w < DET_WORDS; w++) {
+            uint64_t a = re4_rd64(img + (size_t)w * 8);
+            uint64_t c = re4_rd64(now + (size_t)w * 8);
+            if (a != c) {
+                ch++;
+                if (first < 0) {
+                    first = w;
+                }
+                last = w;
+            }
+        }
+        if (ch == 0) {
+            continue;
+        }
+        moved++;
+
+        if (printed >= DET_MAX_PRINT) {
+            truncated = 1;
+        } else {
+            printed++;
+            LOGF("M slot=0x%llx obj=0x%llx vt=0x%llx n=%d %s ch=%d first=+0x%x last=+0x%x\n",
+                 (unsigned long long)d->slot, (unsigned long long)d->obj,
+                 (unsigned long long)d->vt, d->nf,
+                 d->name >= 0 ? (const char *)g_names[d->name].addr : "?",
+                 ch, first * 8, last * 8);
+            int shown = 0;
+            for (int w = 0; w < DET_WORDS && shown < DET_WORDS_PRINT; w++) {
+                uint64_t a = re4_rd64(img + (size_t)w * 8);
+                uint64_t c = re4_rd64(now + (size_t)w * 8);
+                if (a == c) {
+                    continue;
+                }
+                shown++;
+                LOGF("   +%03x %016llx -> %016llx",
+                     w * 8, (unsigned long long)a, (unsigned long long)c);
+                re4_log_float("l", re4_bits_to_float((uint32_t)c));
+                re4_log_float("h", re4_bits_to_float((uint32_t)(c >> 32)));
+                LOGF("\n");
+            }
+            if (ch > DET_WORDS_PRINT) {
+                LOGF("   ... (%d palabras mas)\n", ch - DET_WORDS_PRINT);
+            }
+        }
+
+        // La foto se actualiza al estado actual: la siguiente fase compara contra esto.
+        for (int k = 0; k < DET_BYTES; k++) {
+            img[k] = now[k];
+        }
+    }
+    if (truncated) {
+        LOGF("(solo se detallaron %d objetos; los demas solo cuentan)\n", DET_MAX_PRINT);
+    }
+    LOGF("-- %s: objetos que cambiaron = %d de %d candidatos --\n", label, moved, g_ndet);
+    return moved;
+}
+
+// Hilo aparte: espera a que estes jugando y hace tres fases guiadas por mensajes.
+static void *re4_scan_thread(void *arg) {
+    (void)arg;
+
+    g_probe_fd = re4_open(RE4COOP_PROBE_PATH, RE4_O_WRONLY | RE4_O_CREAT | RE4_O_TRUNC, 0777);
+    log_open(RE4COOP_SCAN_PATH);
+    LOGF("==== re4coop v" RE4COOP_VER_STR " deteccion de movimiento ====\nbuild: %s\nprobe_fd=%d scan_fd=%d\n",
+         BUILD_ID, g_probe_fd, g_fd);
+    log_flush();
+
+    re4_sleep(RE4COOP_FIRST_SCAN_SECS);
+
+    // Fase 1: foto con Leon quieto.
+    notify_step(7, "QUIETO AHORA: no muevas a Leon. Sacando la foto...");
+    re4_det_collect();
+    re4_det_list();
+    log_flush();
+    notify_step(8, "foto 1 lista. AHORA camina 5 s y quedate quieto");
+
+    // Fase 2: caminaste. Lo que cambio es el jugador (y lo que se mueve a su lado).
+    re4_sleep(25);
+    notify_step(9, "midiendo movimiento...");
+    re4_det_report("fase 1: caminaste (aqui esta Leon)");
+    log_flush();
+    notify_step(10, "listo. AHORA gira la camara y suelta");
+
+    // Fase 3: giraste la camara sin caminar. Lo que cambio ahora es la camara.
+    re4_sleep(20);
+    notify_step(11, "midiendo camara...");
+    re4_det_report("fase 2: giraste la camara");
+    log_flush();
+
+    log_close();
+    if (g_probe_fd >= 0) {
+        re4_close(g_probe_fd);
+        g_probe_fd = -1;
+    }
+    notify_step(12, "escaneo terminado. Copia re4coop_scan.txt");
+    return NULL;
 }
 
 // ---------------------------------------------------------------- plugin
@@ -490,8 +833,8 @@ int32_t attr_public plugin_load(int32_t argc, const char* argv[]) {
     snprintf(msg, sizeof(msg), "plugin_load inicio (%s)", BUILD_ID);
     notify_step(1, msg);
 
-    g_fd = re4_open(RE4COOP_LOG_PATH, RE4_O_WRONLY | RE4_O_CREAT | RE4_O_TRUNC, 0777);
-    LOGF("==== re4coop v1.02 reconocimiento ====\nbuild: %s\nargc=%d\n", BUILD_ID, (int)argc);
+    log_open(RE4COOP_LOG_PATH);
+    LOGF("==== re4coop v" RE4COOP_VER_STR " reconocimiento ====\nbuild: %s\n", BUILD_ID);
 
     // 2: modulos cargados (el juego es el primero de la lista).
     static int handles[256];
@@ -501,10 +844,7 @@ int32_t attr_public plugin_load(int32_t argc, const char* argv[]) {
         snprintf(msg, sizeof(msg), "no pude listar los modulos (error 0x%08X)", (unsigned int)r);
         notify_step(2, msg);
         LOGF("error: sceKernelGetModuleList = 0x%08X\n", (unsigned int)r);
-        log_flush();
-        if (g_fd >= 0) {
-            re4_close(g_fd);
-        }
+        log_close();
         return 0;
     }
     if (count > 256) {
@@ -535,10 +875,7 @@ int32_t attr_public plugin_load(int32_t argc, const char* argv[]) {
     }
     if (!main_ok) {
         notify_step(2, "no pude leer los datos del modulo principal");
-        log_flush();
-        if (g_fd >= 0) {
-            re4_close(g_fd);
-        }
+        log_close();
         return 0;
     }
     main_info.name[sizeof(main_info.name) - 1] = 0;
@@ -551,30 +888,37 @@ int32_t attr_public plugin_load(int32_t argc, const char* argv[]) {
     snprintf(msg, sizeof(msg), "modulos: %lu. Principal: %.60s base 0x%llx", count, main_info.name, (unsigned long long)g_base);
     notify_step(2, msg);
 
-    // 3: escaneo (puede tardar un momento).
-    notify_step(3, "buscando nombres de clase en el juego...");
+    // 3: escaneo estatico (puede tardar un momento).
+    notify_step(3, "buscando clases y vtables en el juego...");
     re4_collect_names();
     re4_collect_typeinfos();
-    re4_collect_vtables();
+    re4_collect_census();
     re4_find_code_refs();
 
     // 4: resultado del escaneo.
-    snprintf(msg, sizeof(msg), "nombres de clase: %d, vtables: %d, clases de interes: %d", g_nnames, g_nvt, g_nint);
+    snprintf(msg, sizeof(msg), "nombres de clase: %d, vtables: %d", g_nnames, g_ncen);
     notify_step(4, msg);
-    re4_write_report();
+    re4_write_static_report();
 
     // 5: el log.
     log_flush();
     if (g_fd < 0) {
         snprintf(msg, sizeof(msg), "no pude abrir el log (error 0x%08X)", (unsigned int)g_fd);
     } else {
-        re4_close(g_fd);
         snprintf(msg, sizeof(msg), "log escrito (%lu bytes)", g_total);
     }
+    log_close();
     notify_step(5, msg);
 
-    // 6: si lo ves, el plugin termino sin problemas.
-    notify_step(6, "fin: el plugin termino bien");
+    // 6: hilo que mide en vivo cuando ya estes jugando.
+    void *thread = NULL;
+    int tr = re4_thread_create(&thread, NULL, re4_scan_thread, NULL, "re4coop_scan");
+    if (tr != 0) {
+        snprintf(msg, sizeof(msg), "no pude crear el hilo de escaneo (error 0x%08X)", (unsigned int)tr);
+    } else {
+        snprintf(msg, sizeof(msg), "listo. Entra a tu partida YA: la medicion empieza en %d s", RE4COOP_FIRST_SCAN_SECS);
+    }
+    notify_step(6, msg);
     return 0;
 }
 
