@@ -7,11 +7,11 @@
 attr_public const char *g_pluginName = "re4coop";
 attr_public const char *g_pluginDesc = "RE4 coop - reconocimiento";
 attr_public const char *g_pluginAuth = "re4coop";
-attr_public uint32_t g_pluginVersion = 0x00000109; // 1.09
+attr_public uint32_t g_pluginVersion = 0x0000010a; // 1.10
 
 // Version en texto: sale en CADA mensaje de pantalla y en la cabecera de los logs.
 // Ojo: si cambias la version, cambia tambien el numero de arriba. Nada mas.
-#define RE4COOP_VER_STR "1.09"
+#define RE4COOP_VER_STR "1.10"
 
 // Archivos de salida: los copias de la PS4 a la PC y me los pasas.
 #ifndef RE4COOP_LOG_PATH
@@ -859,10 +859,13 @@ static void re4_log_parts(uintptr_t parts, const char *label) {
 }
 
 // Andar de verdad: en vez de un salto, mover a Leon un poquito muchas veces por
-// segundo. Con 20 pasos por segundo y 1600 unidades/s (lo que avanza caminando) cada
-// paso son 80 unidades, y en pantalla se ve como si anduviera el solo.
-#define RE4COOP_WALK_HZ     20        // pasos por segundo
-#define RE4COOP_WALK_SPEED  1600.0f   // unidades por segundo (andar normal)
+// segundo. La v1.09 dio los numeros exactos (16000 adelante y 16000 atras, desvio
+// 0.0 todo el rato), pero a 20 pasos por segundo cada empujon era de 80 unidades y el
+// juego dibuja a 30 fotogramas: unos fotogramas recibian 80 y otros ninguno, y eso es
+// el temblor que se veia. Ahora son 120 pasos por segundo de 12.3 unidades: cada
+// fotograma recibe uno o dos, todos iguales, y la marcha se ve seguida.
+#define RE4COOP_WALK_HZ     120       // pasos por segundo (suave)
+#define RE4COOP_WALK_SPEED  1480.0f   // unidades por segundo (el paso que medimos)
 #define RE4COOP_WALK_SECS   10        // segundos andando en cada sentido
 
 // La espera entre pasos tiene que ser de milisegundos, y sceKernelSleep solo cuenta
@@ -873,7 +876,8 @@ static void re4_walk(uintptr_t obj, int off, uintptr_t parts, const char *tag, i
     float step = (RE4COOP_WALK_SPEED / (float)RE4COOP_WALK_HZ) * (float)dir;
     int steps = RE4COOP_WALK_HZ * RE4COOP_WALK_SECS;
     char msg[200];
-    snprintf(msg, sizeof(msg), "andando %s %d s: suelta el mando y mira a Leon", tag, RE4COOP_WALK_SECS);
+    snprintf(msg, sizeof(msg), "andando %s %d s suave: suelta el mando y mira a Leon",
+             tag, RE4COOP_WALK_SECS);
     notify_step(step_no, msg);
     re4_sleep(3);   // margen: los avisos de pantalla salen con retraso
 
