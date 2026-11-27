@@ -7,11 +7,11 @@
 attr_public const char *g_pluginName = "re4coop";
 attr_public const char *g_pluginDesc = "RE4 coop - reconocimiento";
 attr_public const char *g_pluginAuth = "re4coop";
-attr_public uint32_t g_pluginVersion = 0x00000105; // 1.05
+attr_public uint32_t g_pluginVersion = 0x00000106; // 1.06
 
 // Version en texto: sale en CADA mensaje de pantalla y en la cabecera de los logs.
 // Ojo: si cambias la version, cambia tambien el numero de arriba. Nada mas.
-#define RE4COOP_VER_STR "1.05"
+#define RE4COOP_VER_STR "1.06"
 
 // Archivos de salida: los copias de la PS4 a la PC y me los pasas.
 #ifndef RE4COOP_LOG_PATH
@@ -610,7 +610,197 @@ typedef struct {
 
 static DetEnt g_det[DET_MAX];
 static int g_ndet;
-static unsigned char g_img[DET_MAX * DET_BYTES];   // "foto" de los objetos
+static unsigned char g_img[DET_MAX * DET_BYTES];
+
+// ---------------------------------------------------------------- Leon, ya localizado
+//
+// Datos de la prueba de la v1.05: entre las clases SIN nombre del juego hay exactamente
+// UNA con 23 funciones virtuales, y 23 es justo lo que tienen cPlAda, cPlAshley,
+// cPlKlauser y cPlWesker. Esa es Leon (vtable 0xd28500 en esta version del juego).
+// Dos globales apuntan al mismo objeto: 0xd58ee0 y 0xea5b10.
+
+static uint32_t re4_float_to_bits(float f) {
+    union { uint32_t u; float f; } x;
+    x.f = f;
+    return x.u;
+}
+
+static int re4_find_leon(void) {
+    for (int i = 0; i < g_ndet; i++) {
+        const DetEnt *d = &g_det[i];
+        if (d->name >= 0 || d->nf != 23) {
+            continue;
+        }
+        if (!re4_readable((uint64_t)d->obj, DET_BYTES)) {
+            continue;
+        }
+        uint64_t own = re4_rd64((const unsigned char *)(uintptr_t)d->obj);
+        if (own == (uint64_t)d->vt) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// La camara: sin nombre y con 3 funciones (22CameraAttachedToMotion tiene 3 tambien,
+// pero esa si trae nombre).
+static int re4_find_cam(void) {
+    for (int i = 0; i < g_ndet; i++) {
+        const DetEnt *d = &g_det[i];
+        if (d->name >= 0 || d->nf != 3) {
+            continue;
+        }
+        if (re4_readable((uint64_t)d->obj, DET_BYTES)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Vuelca los 0x100 bytes del objeto palabra a palabra, para deducir el formato.
+static void re4_dump_full(uintptr_t obj, const char *label) {
+    LOGF("\n== %s  obj=0x%llx ==\n", label, (unsigned long long)obj);
+    for (int w = 0; w < DET_WORDS; w++) {
+        uint64_t v = re4_rd64((const unsigned char *)(uintptr_t)(obj + (uintptr_t)w * 8));
+        LOGF("   +%03x %016llx", w * 8, (unsigned long long)v);
+        re4_log_float("l", re4_bits_to_float((uint32_t)v));
+        re4_log_float("h", re4_bits_to_float((uint32_t)(v >> 32)));
+        LOGF("\n");
+    }
+}
+
+// Muestrea el objeto una vez por segundo mientras caminas: la coordenada que avanza
+// de forma continua es la posicion; un angulo o una matriz se queda practicamente igual.
+static void re4_trace(uintptr_t obj, int seconds) {
+    LOGF("\n== traza caminando (1 muestra por segundo, palabras +0x10..+0x48) ==\n");
+    for (int s = 0; s < seconds; s++) {
+        LOGF("T%02d", s);
+        for (int w = 2; w <= 9; w++) {
+            uint64_t v = re4_rd64((const unsigned char *)(uintptr_t)(obj + (uintptr_t)w * 8));
+            LOGF(" +%02x", w * 8);
+            re4_log_float("l", re4_bits_to_float((uint32_t)v));
+            re4_log_float("h", re4_bits_to_float((uint32_t)(v >> 32)));
+        }
+        LOGF("\n");
+        log_flush();
+        if (s + 1 < seconds) {
+            re4_sleep(1);
+        }
+    }
+}
+
+// Cual de los campos que cambiaron al caminar tiene mas pinta de coordenada.
+typedef struct {
+    int off;      // byte dentro del objeto (-1 si no hay candidato)
+    int valid;
+    float before;
+    float after;
+    float delta;
+} BestMove;
+
+static BestMove re4_leon_moved(uintptr_t obj, const unsigned char *img) {
+    BestMove best;
+    best.off = -1;
+    best.valid = 0;
+    best.before = 0.0f;
+    best.after = 0.0f;
+    best.delta = 0.0f;
+    float bestabs = 0.0f;
+
+    LOGF("\n== LEON: campos que cambiaron al caminar (mitad por mitad) ==\n");
+    for (int w = 0; w < DET_WORDS; w++) {
+        uint64_t a = re4_rd64(img + (size_t)w * 8);
+        uint64_t c = re4_rd64((const unsigned char *)(uintptr_t)(obj + (uintptr_t)w * 8));
+        if (a == c) {
+            continue;
+        }
+        for (int half = 0; half < 2; half++) {
+            uint32_t ab = half ? (uint32_t)(a >> 32) : (uint32_t)a;
+            uint32_t cb = half ? (uint32_t)(c >> 32) : (uint32_t)c;
+            float af = re4_bits_to_float(ab);
+            float cf = re4_bits_to_float(cb);
+            float d = cf - af;
+            LOGF("   +%03x%s %08x -> %08x", w * 8 + half * 4, half ? "H" : "L",
+                 (unsigned int)ab, (unsigned int)cb);
+            re4_log_float("antes", af);
+            re4_log_float("ahora", cf);
+            re4_log_float("dif", d);
+            LOGF("\n");
+            if (!(af > -100000.0f && af < 100000.0f)) {
+                continue;   // infinito, NaN o basura
+            }
+            if (!(cf > -100000.0f && cf < 100000.0f)) {
+                continue;
+            }
+            float ad = d < 0.0f ? -d : d;
+            // Una coordenada vale cientos o miles y se movio bastante. Un angulo
+            // (seno/coseno) esta entre -7 y 7 y casi no cambia al caminar recto.
+            if ((af > 50.0f || af < -50.0f) && ad > 100.0f && ad > bestabs) {
+                bestabs = ad;
+                best.off = w * 8 + half * 4;
+                best.before = af;
+                best.after = cf;
+                best.delta = d;
+                best.valid = 1;
+            }
+        }
+    }
+    return best;
+}
+
+// Suma delta a todos los campos del objeto que valgan exactamente match_bits (la
+// posicion suele estar copiada en varios sitios), y guarda lo original para deshacerlo.
+#define PAT_MAX 16
+typedef struct { int off; uint32_t bits; } PatEnt;
+static PatEnt g_pat[PAT_MAX];
+static int g_pat_n;
+
+static int re4_patch_delta(uintptr_t obj, uint32_t match_bits, float delta) {
+    int hits = 0;
+    g_pat_n = 0;
+    for (int w = 0; w < DET_WORDS; w++) {
+        uintptr_t a = obj + (uintptr_t)w * 8;
+        uint64_t v = re4_rd64((const unsigned char *)(uintptr_t)a);
+        int dirty = 0;
+        for (int half = 0; half < 2; half++) {
+            uint32_t b = half ? (uint32_t)(v >> 32) : (uint32_t)v;
+            if (b != match_bits || g_pat_n >= PAT_MAX) {
+                continue;
+            }
+            uint32_t nb = re4_float_to_bits(re4_bits_to_float(b) + delta);
+            g_pat[g_pat_n].off = w * 8 + half * 4;
+            g_pat[g_pat_n].bits = b;
+            g_pat_n++;
+            hits++;
+            if (half) {
+                v = (v & 0x00000000FFFFFFFFULL) | ((uint64_t)nb << 32);
+            } else {
+                v = (v & 0xFFFFFFFF00000000ULL) | (uint64_t)nb;
+            }
+            dirty = 1;
+        }
+        if (dirty) {
+            *(volatile uint64_t *)(void *)a = v;
+        }
+    }
+    return hits;
+}
+
+static void re4_unpatch(uintptr_t obj) {
+    for (int i = 0; i < g_pat_n; i++) {
+        uintptr_t addr = obj + (uintptr_t)g_pat[i].off;
+        uintptr_t base = addr & ~(uintptr_t)7;
+        uint64_t v = re4_rd64((const unsigned char *)(uintptr_t)base);
+        if ((addr - base) >= 4) {
+            v = (v & 0x00000000FFFFFFFFULL) | ((uint64_t)g_pat[i].bits << 32);
+        } else {
+            v = (v & 0xFFFFFFFF00000000ULL) | (uint64_t)g_pat[i].bits;
+        }
+        *(volatile uint64_t *)(void *)base = v;
+    }
+    g_pat_n = 0;
+}
+   // "foto" de los objetos
 
 static int re4_det_want(const char *nm) {
     return re4_contains(nm, "cPl") || re4_contains(nm, "Player") ||
@@ -793,25 +983,86 @@ static void *re4_scan_thread(void *arg) {
 
     re4_sleep(RE4COOP_FIRST_SCAN_SECS);
 
-    // Fase 1: foto con Leon quieto.
+    // Fase 1: foto de todo, y retrato a fondo de Leon (que ya sabemos quien es).
     notify_step(7, "QUIETO AHORA: no muevas a Leon. Sacando la foto...");
     re4_det_collect();
     re4_det_list();
     log_flush();
-    notify_step(8, "foto 1 lista. AHORA camina 5 s y quedate quieto");
 
-    // Fase 2: caminaste. Lo que cambio es el jugador (y lo que se mueve a su lado).
-    re4_sleep(25);
+    int leon = re4_find_leon();
+    uintptr_t leon_obj = 0;
+    unsigned char leon_img[DET_BYTES];
+    for (int k = 0; k < DET_BYTES; k++) {
+        leon_img[k] = 0;
+    }
+    if (leon >= 0) {
+        leon_obj = (uintptr_t)g_det[leon].obj;
+        LOGF("\n== LEON: candidato C%03d slot=0x%llx obj=0x%llx vt=0x%llx (sin nombre, 23 funciones)\n",
+             leon, (unsigned long long)g_det[leon].slot, (unsigned long long)leon_obj,
+             (unsigned long long)g_det[leon].vt);
+        const unsigned char *lp = (const unsigned char *)(uintptr_t)leon_obj;
+        for (int k = 0; k < DET_BYTES; k++) {
+            leon_img[k] = lp[k];
+        }
+        re4_dump_full(leon_obj, "LEON quieto");
+    } else {
+        LOGF("\n== LEON: no encontrado (ninguna clase sin nombre con 23 funciones) ==\n");
+    }
+
+    int cam = re4_find_cam();
+    if (cam >= 0) {
+        LOGF("\n== CAMARA: candidato C%03d slot=0x%llx obj=0x%llx vt=0x%llx (sin nombre, 3 funciones)\n",
+             cam, (unsigned long long)g_det[cam].slot, (unsigned long long)g_det[cam].obj,
+             (unsigned long long)g_det[cam].vt);
+        re4_dump_full((uintptr_t)g_det[cam].obj, "CAMARA quieta");
+    }
+    log_flush();
+
+    notify_step(8, "AHORA camina recto y sin parar 8 s, luego sueltate");
+    if (leon >= 0) {
+        re4_trace(leon_obj, 8);
+    } else {
+        re4_sleep(8);
+    }
+
     notify_step(9, "midiendo movimiento...");
-    re4_det_report("fase 1: caminaste (aqui esta Leon)");
+    re4_det_report("fase 1: caminaste");
+    BestMove best;
+    best.off = -1;
+    best.valid = 0;
+    best.before = 0.0f;
+    best.after = 0.0f;
+    best.delta = 0.0f;
+    if (leon >= 0) {
+        best = re4_leon_moved(leon_obj, leon_img);
+        re4_dump_full(leon_obj, "LEON despues de caminar");
+    }
     log_flush();
-    notify_step(10, "listo. AHORA gira la camara y suelta");
 
-    // Fase 3: giraste la camara sin caminar. Lo que cambio ahora es la camara.
-    re4_sleep(20);
-    notify_step(11, "midiendo camara...");
-    re4_det_report("fase 2: giraste la camara");
-    log_flush();
+    // Prueba de escritura: si el campo elegido es la posicion, Leon se mueve ~10 metros.
+    if (leon >= 0 && best.valid) {
+        notify_step(10, "voy a mover a Leon por codigo: mira la pantalla");
+        LOGF("\n== PRUEBA DE ESCRITURA ==\ncampo elegido: +0x%x\n", best.off);
+        re4_log_float("valor", best.before);
+        re4_log_float("cambio_al_caminar", best.delta);
+        LOGF("\nvoy a sumar 1000.0 (unos 10 m) a ese valor y a sus copias\n");
+        log_flush();
+        int hits = re4_patch_delta(leon_obj, re4_float_to_bits(best.before), 1000.0f);
+        LOGF("campos escritos: %d\n", hits);
+        for (int i = 0; i < g_pat_n; i++) {
+            LOGF("   escrito +0x%x\n", g_pat[i].off);
+        }
+        log_flush();
+        re4_sleep(4);
+        notify_step(11, "lo devuelvo a su sitio...");
+        re4_unpatch(leon_obj);
+        LOGF("campos restaurados a su valor original\n");
+        log_flush();
+        re4_sleep(1);
+    } else {
+        notify_step(10, "sin candidato claro: no escribo nada, solo queda el volcado");
+        re4_sleep(2);
+    }
 
     log_close();
     if (g_probe_fd >= 0) {
