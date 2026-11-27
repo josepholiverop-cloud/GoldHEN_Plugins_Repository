@@ -7,11 +7,11 @@
 attr_public const char *g_pluginName = "re4coop";
 attr_public const char *g_pluginDesc = "RE4 coop - reconocimiento";
 attr_public const char *g_pluginAuth = "re4coop";
-attr_public uint32_t g_pluginVersion = 0x00000106; // 1.06
+attr_public uint32_t g_pluginVersion = 0x00000107; // 1.07
 
 // Version en texto: sale en CADA mensaje de pantalla y en la cabecera de los logs.
 // Ojo: si cambias la version, cambia tambien el numero de arriba. Nada mas.
-#define RE4COOP_VER_STR "1.06"
+#define RE4COOP_VER_STR "1.07"
 
 // Archivos de salida: los copias de la PS4 a la PC y me los pasas.
 #ifndef RE4COOP_LOG_PATH
@@ -698,7 +698,7 @@ typedef struct {
     float delta;
 } BestMove;
 
-static BestMove re4_leon_moved(uintptr_t obj, const unsigned char *img) {
+static BestMove re4_leon_moved(uintptr_t obj, const unsigned char *img, BestMove *second) {
     BestMove best;
     best.off = -1;
     best.valid = 0;
@@ -706,6 +706,14 @@ static BestMove re4_leon_moved(uintptr_t obj, const unsigned char *img) {
     best.after = 0.0f;
     best.delta = 0.0f;
     float bestabs = 0.0f;
+
+    // El segundo mejor, para probar tambien la otra componente horizontal.
+    second->off = -1;
+    second->valid = 0;
+    second->before = 0.0f;
+    second->after = 0.0f;
+    second->delta = 0.0f;
+    float secondabs = 0.0f;
 
     LOGF("\n== LEON: campos que cambiaron al caminar (mitad por mitad) ==\n");
     for (int w = 0; w < DET_WORDS; w++) {
@@ -735,13 +743,34 @@ static BestMove re4_leon_moved(uintptr_t obj, const unsigned char *img) {
             float ad = d < 0.0f ? -d : d;
             // Una coordenada vale cientos o miles y se movio bastante. Un angulo
             // (seno/coseno) esta entre -7 y 7 y casi no cambia al caminar recto.
-            if ((af > 50.0f || af < -50.0f) && ad > 100.0f && ad > bestabs) {
+            if (!(af > 50.0f || af < -50.0f) || ad < 5.0f) {
+                continue;
+            }
+            // El mismo valor suele estar copiado en varios sitios del objeto: se
+            // guarda una sola vez para no probar dos veces la misma coordenada.
+            uint32_t cb_bits = re4_float_to_bits(cf);
+            if (best.valid && re4_float_to_bits(best.after) == cb_bits) {
+                continue;
+            }
+            if (second->valid && re4_float_to_bits(second->after) == cb_bits) {
+                continue;
+            }
+            BestMove cand;
+            cand.off = w * 8 + half * 4;
+            cand.valid = 1;
+            cand.before = af;
+            cand.after = cf;
+            cand.delta = d;
+            if (!best.valid || ad > bestabs) {
+                if (best.valid) {
+                    *second = best;
+                    secondabs = bestabs;
+                }
+                best = cand;
                 bestabs = ad;
-                best.off = w * 8 + half * 4;
-                best.before = af;
-                best.after = cf;
-                best.delta = d;
-                best.valid = 1;
+            } else if (!second->valid || ad > secondabs) {
+                *second = cand;
+                secondabs = ad;
             }
         }
     }
@@ -799,6 +828,54 @@ static void re4_unpatch(uintptr_t obj) {
         *(volatile uint64_t *)(void *)base = v;
     }
     g_pat_n = 0;
+}
+
+// Lee los 4 bytes de un campo del objeto (off dice cual de las dos mitades de la palabra).
+static uint32_t re4_field_bits(uintptr_t obj, int off) {
+    uintptr_t addr = obj + (uintptr_t)off;
+    uintptr_t base = addr & ~(uintptr_t)7;
+    uint64_t v = re4_rd64((const unsigned char *)(uintptr_t)base);
+    return (addr - base) >= 4 ? (uint32_t)(v >> 32) : (uint32_t)v;
+}
+
+// Mueve el campo elegido unas 1000 unidades (unos 10 m) y lo devuelve a su sitio.
+// Se lee ANTES de escribir el valor actual: al caminar ese numero ya habia cambiado,
+// y la version 1.06 buscaba el viejo (por eso escribia 0 campos).
+static void re4_write_test(uintptr_t obj, const BestMove *b, const char *tag) {
+    char msg[200];
+    snprintf(msg, sizeof(msg), "prueba %s: moviendo a Leon (+0x%x). No toques el mando", tag, b->off);
+    notify_step(10, msg);
+
+    uint32_t cur = re4_field_bits(obj, b->off);
+    LOGF("\n== PRUEBA DE ESCRITURA %s: campo +0x%x ==\n", tag, b->off);
+    re4_log_float("al_caminar", b->before);
+    re4_log_float("despues", b->after);
+    re4_log_float("leido_ahora", re4_bits_to_float(cur));
+    LOGF("voy a sumar 1000.0 (unos 10 m) a ese valor y a sus copias\n");
+    log_flush();
+
+    int hits = re4_patch_delta(obj, cur, 1000.0f);
+    LOGF("campos escritos: %d\n", hits);
+    for (int i = 0; i < g_pat_n; i++) {
+        LOGF("   escrito +0x%x\n", g_pat[i].off);
+    }
+    re4_log_float("tras_escribir", re4_bits_to_float(re4_field_bits(obj, b->off)));
+    log_flush();
+
+    // Si el juego recalcula el campo en cada fotograma, se vuelve solo a su valor.
+    re4_sleep(1);
+    re4_log_float("tras_1s", re4_bits_to_float(re4_field_bits(obj, b->off)));
+    log_flush();
+    re4_sleep(2);
+    re4_log_float("tras_3s", re4_bits_to_float(re4_field_bits(obj, b->off)));
+    LOGF("\n");
+    log_flush();
+
+    notify_step(11, "devuelvo a Leon a su sitio...");
+    re4_unpatch(obj);
+    re4_log_float("restaurado", re4_bits_to_float(re4_field_bits(obj, b->off)));
+    log_flush();
+    re4_sleep(2);
 }
    // "foto" de los objetos
 
@@ -1018,47 +1095,39 @@ static void *re4_scan_thread(void *arg) {
     }
     log_flush();
 
-    notify_step(8, "AHORA camina recto y sin parar 8 s, luego sueltate");
+    notify_step(8, "AHORA camina recto y sin parar: cuento 12 s desde YA");
+    // Los avisos de pantalla se muestran con retraso (en la v1.06 el #9 salio a los
+    // pocos segundos y solo se midieron los 2 ultimos). Se espera un poco antes de
+    // medir para que los 12 segundos de caminata cuenten enteros.
+    re4_sleep(3);
     if (leon >= 0) {
-        re4_trace(leon_obj, 8);
+        re4_trace(leon_obj, 12);
     } else {
-        re4_sleep(8);
+        re4_sleep(12);
     }
 
     notify_step(9, "midiendo movimiento...");
     re4_det_report("fase 1: caminaste");
     BestMove best;
+    BestMove second;
     best.off = -1;
     best.valid = 0;
     best.before = 0.0f;
     best.after = 0.0f;
     best.delta = 0.0f;
+    second = best;
     if (leon >= 0) {
-        best = re4_leon_moved(leon_obj, leon_img);
+        best = re4_leon_moved(leon_obj, leon_img, &second);
         re4_dump_full(leon_obj, "LEON despues de caminar");
     }
     log_flush();
 
     // Prueba de escritura: si el campo elegido es la posicion, Leon se mueve ~10 metros.
     if (leon >= 0 && best.valid) {
-        notify_step(10, "voy a mover a Leon por codigo: mira la pantalla");
-        LOGF("\n== PRUEBA DE ESCRITURA ==\ncampo elegido: +0x%x\n", best.off);
-        re4_log_float("valor", best.before);
-        re4_log_float("cambio_al_caminar", best.delta);
-        LOGF("\nvoy a sumar 1000.0 (unos 10 m) a ese valor y a sus copias\n");
-        log_flush();
-        int hits = re4_patch_delta(leon_obj, re4_float_to_bits(best.before), 1000.0f);
-        LOGF("campos escritos: %d\n", hits);
-        for (int i = 0; i < g_pat_n; i++) {
-            LOGF("   escrito +0x%x\n", g_pat[i].off);
+        re4_write_test(leon_obj, &best, "A");
+        if (second.valid && second.off != best.off) {
+            re4_write_test(leon_obj, &second, "B");
         }
-        log_flush();
-        re4_sleep(4);
-        notify_step(11, "lo devuelvo a su sitio...");
-        re4_unpatch(leon_obj);
-        LOGF("campos restaurados a su valor original\n");
-        log_flush();
-        re4_sleep(1);
     } else {
         notify_step(10, "sin candidato claro: no escribo nada, solo queda el volcado");
         re4_sleep(2);
