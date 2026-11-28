@@ -7,11 +7,11 @@
 attr_public const char *g_pluginName = "re4coop";
 attr_public const char *g_pluginDesc = "RE4 coop - reconocimiento";
 attr_public const char *g_pluginAuth = "re4coop";
-attr_public uint32_t g_pluginVersion = 0x0000010a; // 1.10
+attr_public uint32_t g_pluginVersion = 0x0000010b; // 1.11
 
 // Version en texto: sale en CADA mensaje de pantalla y en la cabecera de los logs.
 // Ojo: si cambias la version, cambia tambien el numero de arriba. Nada mas.
-#define RE4COOP_VER_STR "1.10"
+#define RE4COOP_VER_STR "1.11"
 
 // Archivos de salida: los copias de la PS4 a la PC y me los pasas.
 #ifndef RE4COOP_LOG_PATH
@@ -858,64 +858,361 @@ static void re4_log_parts(uintptr_t parts, const char *label) {
     LOGF("\n");
 }
 
-// Andar de verdad: en vez de un salto, mover a Leon un poquito muchas veces por
-// segundo. La v1.09 dio los numeros exactos (16000 adelante y 16000 atras, desvio
-// 0.0 todo el rato), pero a 20 pasos por segundo cada empujon era de 80 unidades y el
-// juego dibuja a 30 fotogramas: unos fotogramas recibian 80 y otros ninguno, y eso es
-// el temblor que se veia. Ahora son 120 pasos por segundo de 12.3 unidades: cada
-// fotograma recibe uno o dos, todos iguales, y la marcha se ve seguida.
-#define RE4COOP_WALK_HZ     120       // pasos por segundo (suave)
-#define RE4COOP_WALK_SPEED  1480.0f   // unidades por segundo (el paso que medimos)
-#define RE4COOP_WALK_SECS   10        // segundos andando en cada sentido
+// ---------------------------------------------------------------- mando 2 (libScePad)
+//
+// Para leer el mando 2 hay que hablar con libScePad, que el juego ya trae cargado
+// (libScePad.sprx). En vez de enlazar la libreria (eso obligaria a tocar el Makefile)
+// se pide cada funcion por su nombre al modulo que ya esta en memoria. Si algo de
+// esto falla, queda anotado en el log y el plugin no hace nada mas: nada de cierres.
 
-// La espera entre pasos tiene que ser de milisegundos, y sceKernelSleep solo cuenta
-// segundos enteros: por eso este otro, del mismo libkernel.
+extern int re4_dlsym(int handle, const char *symbol, void **address) __asm__("sceKernelDlsym");
+extern int re4_load_module(const char *path, int argc, const void *argv, int flags,
+                          const void *opt, int *handle) __asm__("sceKernelLoadStartModule");
+
+// La espera entre pasos va en microsegundos: sceKernelSleep solo cuenta segundos.
 extern int re4_usleep(unsigned int useconds) __asm__("sceKernelUsleep");
 
-static void re4_walk(uintptr_t obj, int off, uintptr_t parts, const char *tag, int dir, int step_no) {
-    float step = (RE4COOP_WALK_SPEED / (float)RE4COOP_WALK_HZ) * (float)dir;
-    int steps = RE4COOP_WALK_HZ * RE4COOP_WALK_SECS;
-    char msg[200];
-    snprintf(msg, sizeof(msg), "andando %s %d s suave: suelta el mando y mira a Leon",
-             tag, RE4COOP_WALK_SECS);
-    notify_step(step_no, msg);
-    re4_sleep(3);   // margen: los avisos de pantalla salen con retraso
+typedef int (*Re4PadInit)(void);
+typedef int (*Re4PadOpen)(int user_id, int type, int index, const void *param);
+typedef int (*Re4PadReadState)(int handle, void *data);
+typedef int (*Re4PadClose)(int handle);
+typedef int (*Re4UserInitial)(int *user_id);
 
-    LOGF("\n== ANDAR %s: campo +0x%x, %d pasos de %.1f unidades ==\n",
-         tag, off, steps, step);
-    re4_log_float("inicio", re4_bits_to_float(re4_field_bits(obj, off)));
-    if (parts) {
-        re4_log_parts(parts, "inicio");
+static Re4PadInit      g_pad_init;
+static Re4PadOpen      g_pad_open;
+static Re4PadReadState g_pad_read;
+static Re4PadClose     g_pad_close;
+
+// Handles de los modulos que el juego ya tiene cargados (los rellena plugin_load).
+static int g_mod_pad = -1;
+static int g_mod_user = -1;
+
+#define RE4_PAD_MAX 6
+static int g_pad_handle[RE4_PAD_MAX];
+static int g_pad_which[RE4_PAD_MAX];   // indice del mando dentro de la cuenta
+static int g_pad_n;
+
+// El informe del mando se lee crudo y se interpreta por offsets, para no depender de
+// acertar con la estructura exacta del SDK.
+#define RE4_PAD_BYTES 0x60
+#define RE4_PAD_BTN   0x00
+#define RE4_PAD_LX    0x04
+#define RE4_PAD_LY    0x05
+#define RE4_PAD_RX    0x06
+#define RE4_PAD_RY    0x07
+
+static unsigned char g_pad_buf[RE4_PAD_MAX][RE4_PAD_BYTES];
+
+static int re4_pad_load_module(void) {
+    if (g_mod_pad >= 0) {
+        return g_mod_pad;
     }
+    int h = -1;
+    int r = re4_load_module("libScePad.sprx", 0, NULL, 0, NULL, &h);
+    if (r != 0 || h < 0) {
+        LOGF("   no pude cargar libScePad (0x%08X)\n", (unsigned int)r);
+        return -1;
+    }
+    g_mod_pad = h;
+    return g_mod_pad;
+}
+
+static int re4_pad_resolve(void) {
+    if (g_pad_read != NULL) {
+        return 0;
+    }
+    int h = re4_pad_load_module();
+    if (h < 0) {
+        return -1;
+    }
+    void *fn = NULL;
+    int r;
+
+    r = re4_dlsym(h, "scePadInit", &fn);
+    if (r == 0 && fn != NULL) {
+        g_pad_init = (Re4PadInit)(uintptr_t)fn;
+    } else {
+        LOGF("   scePadInit: 0x%08X\n", (unsigned int)r);
+    }
+
+    fn = NULL;
+    r = re4_dlsym(h, "scePadOpen", &fn);
+    if (r == 0 && fn != NULL) {
+        g_pad_open = (Re4PadOpen)(uintptr_t)fn;
+    } else {
+        LOGF("   scePadOpen: 0x%08X\n", (unsigned int)r);
+    }
+
+    fn = NULL;
+    r = re4_dlsym(h, "scePadReadState", &fn);
+    if (r == 0 && fn != NULL) {
+        g_pad_read = (Re4PadReadState)(uintptr_t)fn;
+    } else {
+        LOGF("   scePadReadState: 0x%08X\n", (unsigned int)r);
+    }
+
+    fn = NULL;
+    r = re4_dlsym(h, "scePadClose", &fn);
+    if (r == 0 && fn != NULL) {
+        g_pad_close = (Re4PadClose)(uintptr_t)fn;
+    } else {
+        LOGF("   scePadClose: 0x%08X\n", (unsigned int)r);
+    }
+
+    if (g_pad_open == NULL || g_pad_read == NULL) {
+        LOGF("   sin funciones del mando: no puedo seguir\n");
+        return -1;
+    }
+    if (g_pad_init != NULL) {
+        int ir = g_pad_init();
+        LOGF("   scePadInit = 0x%08X\n", (unsigned int)ir);
+    }
+    return 0;
+}
+
+static int re4_pad_user(void) {
+    int user = 0x1000000;
+    if (g_mod_user >= 0) {
+        void *fn = NULL;
+        if (re4_dlsym(g_mod_user, "sceUserServiceGetInitialUser", &fn) == 0 && fn != NULL) {
+            Re4UserInitial get = (Re4UserInitial)(uintptr_t)fn;
+            int u = 0;
+            if (get(&u) == 0 && u != 0) {
+                user = u;
+            }
+        }
+    }
+    return user;
+}
+
+static void re4_pad_add(int handle, int which) {
+    if (handle < 0 || g_pad_n >= RE4_PAD_MAX) {
+        return;
+    }
+    g_pad_handle[g_pad_n] = handle;
+    g_pad_which[g_pad_n] = which;
+    g_pad_n++;
+}
+
+// Abre todos los mandos que se dejen: indices 0..3 de la cuenta de siempre y, por si el
+// segundo mando esta en otra cuenta, indices 0..1 de la siguiente.
+static int re4_pad_open_all(void) {
+    g_pad_n = 0;
+    LOGF("\n== mando 2: preparando libScePad (modulo=0x%x) ==\n", g_mod_pad);
+    if (re4_pad_resolve() != 0) {
+        return -1;
+    }
+    int user = re4_pad_user();
+    LOGF("   userId=0x%x\n", user);
+    for (int k = 0; k < 4; k++) {
+        int h = g_pad_open(user, 0, k, NULL);
+        LOGF("   scePadOpen(user=0x%x, idx=%d) = %d\n", user, k, h);
+        re4_pad_add(h, k);
+    }
+    for (int k = 0; k < 2; k++) {
+        int h = g_pad_open(user + 1, 0, k, NULL);
+        LOGF("   scePadOpen(user=0x%x, idx=%d) = %d\n", user + 1, k, h);
+        re4_pad_add(h, k);
+    }
+    LOGF("   mandos abiertos: %d\n", g_pad_n);
+    log_flush();
+    return g_pad_n;
+}
+
+static int re4_pad_read_one(int slot) {
+    if (slot < 0 || slot >= g_pad_n) {
+        return -1;
+    }
+    unsigned char *d = g_pad_buf[slot];
+    for (int k = 0; k < RE4_PAD_BYTES; k++) {
+        d[k] = 0;
+    }
+    return g_pad_read(g_pad_handle[slot], d);
+}
+
+static int re4_pad_stick(int v) {
+    int d = v - 128;
+    if (d > 127) {
+        d = 127;
+    }
+    if (d < -128) {
+        d = -128;
+    }
+    return d;
+}
+
+// Fase de sondeo: se queda 8 s mirando todos los mandos abiertos mientras tu mueves
+// SOLO el mando 2. El que se mueva, ese es.
+static int re4_pad_probe(int step_no, int seconds) {
+    notify_step(step_no, "SONDA: suelta el mando 1 y mueve SOLO el mando 2 (stick izq. en circulos)");
+    re4_sleep(3);
+    LOGF("\n== SONDEO DE MANDOS (%d s): mueve solo el mando 2 ==\n", seconds);
     log_flush();
 
-    uint32_t start_bits = re4_field_bits(obj, off);
-    float start = re4_bits_to_float(start_bits);
-    int misses = 0;
-    for (int i = 0; i < steps; i++) {
-        uint32_t cur = re4_field_bits(obj, off);
-        int hits = re4_patch_delta(obj, cur, step);
-        g_pat_n = 0;
-        if (hits == 0) {
-            misses++;   // el valor ya no estaba donde creiamos: el juego lo cambio
+    int activ[RE4_PAD_MAX];
+    uint32_t prev_btn[RE4_PAD_MAX];
+    int fails[RE4_PAD_MAX];
+    for (int j = 0; j < g_pad_n; j++) {
+        activ[j] = 0;
+        fails[j] = 0;
+        prev_btn[j] = 0;
+        if (re4_pad_read_one(j) == 0) {
+            prev_btn[j] = (uint32_t)re4_rd32(g_pad_buf[j] + RE4_PAD_BTN);
         }
-        if ((i + 1) % RE4COOP_WALK_HZ == 0) {
-            float now = re4_bits_to_float(re4_field_bits(obj, off));
-            float real = now - start;
-            float want = step * (float)(i + 1);
-            LOGF("   t=%ds real=%.1f esperado=%.1f desvio=%.1f pasos_sin_copias=%d\n",
-                 (i + 1) / RE4COOP_WALK_HZ, real, want, real - want, misses);
-            if (parts) {
-                re4_log_parts(parts, "ahora");
+    }
+
+    int ticks = seconds * 4;
+    for (int t = 0; t < ticks; t++) {
+        for (int j = 0; j < g_pad_n; j++) {
+            if (re4_pad_read_one(j) != 0) {
+                fails[j]++;
+                continue;
             }
+            const unsigned char *d = g_pad_buf[j];
+            int a = re4_pad_stick((int)d[RE4_PAD_LX]);
+            int b = re4_pad_stick((int)d[RE4_PAD_LY]);
+            int c = re4_pad_stick((int)d[RE4_PAD_RX]);
+            int e = re4_pad_stick((int)d[RE4_PAD_RY]);
+            int m = (a < 0 ? -a : a) + (b < 0 ? -b : b) + (c < 0 ? -c : c) + (e < 0 ? -e : e);
+            uint32_t btn = (uint32_t)re4_rd32(d + RE4_PAD_BTN);
+            if (btn != prev_btn[j]) {
+                m += 300;
+                prev_btn[j] = btn;
+            }
+            activ[j] += m;
+        }
+        if ((t % 4) == 3) {
+            LOGF("   t=%ds", (t + 1) / 4);
+            for (int j = 0; j < g_pad_n; j++) {
+                const unsigned char *d = g_pad_buf[j];
+                LOGF("  [h=%d idx=%d act=%d fallos=%d lx=%d ly=%d btn=%08x]",
+                     g_pad_handle[j], g_pad_which[j], activ[j], fails[j],
+                     (int)d[RE4_PAD_LX], (int)d[RE4_PAD_LY],
+                     (unsigned int)re4_rd32(d + RE4_PAD_BTN));
+            }
+            LOGF("\n");
             log_flush();
         }
-        re4_usleep(1000000u / (unsigned int)RE4COOP_WALK_HZ);
+        re4_usleep(250000);
     }
-    re4_log_float("final", re4_bits_to_float(re4_field_bits(obj, off)));
+
+    int best = -1;
+    int bestv = 0;
+    for (int j = 0; j < g_pad_n; j++) {
+        if (activ[j] > bestv) {
+            bestv = activ[j];
+            best = j;
+        }
+    }
+    if (best < 0 || bestv < 400) {
+        LOGF("   elegido: ninguno (actividad maxima %d)\n", bestv);
+        log_flush();
+        return -1;
+    }
+    LOGF("   elegido: handle %d, indice %d, actividad %d\n",
+         g_pad_handle[best], g_pad_which[best], bestv);
+    log_flush();
+    return best;
+}
+
+#define RE4COOP_PAD_HZ    120
+#define RE4COOP_PAD_SPEED 1500.0f
+#define RE4COOP_PAD_SECS  15
+#define RE4COOP_PAD_DEAD  30
+
+// Mover a Leon con el stick izquierdo del mando 2, en empujones pequenos y continuos
+// (los mismos 120 pasos por segundo de la v1.10). El stick arriba mueve en un eje del
+// mapa y el stick a los lados en el otro: todavia no giramos segun la camara.
+static void re4_pad_drive(uintptr_t obj, int offx, int offz, uintptr_t parts, int slot, int step_no) {
+    char msg[200];
+    snprintf(msg, sizeof(msg), "AHORA el stick IZQUIERDO del mando 2: %d s", RE4COOP_PAD_SECS);
+    notify_step(step_no, msg);
+    re4_sleep(3);
+
+    LOGF("\n== MANDO 2: %d s con el stick izquierdo (%.0f u/s a %d Hz) ==\n",
+         RE4COOP_PAD_SECS, RE4COOP_PAD_SPEED, RE4COOP_PAD_HZ);
+    LOGF("   campo x=+0x%x campo z=+0x%x\n", offx, offz);
+    re4_log_float("x_inicio", re4_bits_to_float(re4_field_bits(obj, offx)));
+    if (offz >= 0) {
+        re4_log_float("z_inicio", re4_bits_to_float(re4_field_bits(obj, offz)));
+    }
     LOGF("\n");
     log_flush();
-    re4_sleep(1);
+
+    float start_x = re4_bits_to_float(re4_field_bits(obj, offx));
+    float start_z = (offz >= 0) ? re4_bits_to_float(re4_field_bits(obj, offz)) : 0.0f;
+    float want_x = 0.0f;
+    float want_z = 0.0f;
+    int misses = 0;
+    int fails = 0;
+    int steps = RE4COOP_PAD_HZ * RE4COOP_PAD_SECS;
+    float per_step = RE4COOP_PAD_SPEED / (float)RE4COOP_PAD_HZ;
+
+    for (int i = 0; i < steps; i++) {
+        int lx = 128;
+        int ly = 128;
+        if (re4_pad_read_one(slot) == 0) {
+            lx = (int)g_pad_buf[slot][RE4_PAD_LX];
+            ly = (int)g_pad_buf[slot][RE4_PAD_LY];
+        } else {
+            fails++;
+            ly = 128;   // si no hay lectura, se queda quieto
+            lx = 128;
+        }
+        int ax = re4_pad_stick(lx);
+        int ay = re4_pad_stick(ly);
+        float dx = 0.0f;
+        float dz = 0.0f;
+        if (ax > RE4COOP_PAD_DEAD || ax < -RE4COOP_PAD_DEAD) {
+            dx = ((float)ax / 127.0f) * per_step;
+        }
+        if (ay > RE4COOP_PAD_DEAD || ay < -RE4COOP_PAD_DEAD) {
+            dz = -((float)ay / 127.0f) * per_step;   // arriba = adelante
+        }
+        if (dx != 0.0f) {
+            uint32_t cur = re4_field_bits(obj, offx);
+            if (re4_patch_delta(obj, cur, dx) == 0) {
+                misses++;
+            }
+            g_pat_n = 0;
+        }
+        if (offz >= 0 && dz != 0.0f) {
+            uint32_t cur = re4_field_bits(obj, offz);
+            if (re4_patch_delta(obj, cur, dz) == 0) {
+                misses++;
+            }
+            g_pat_n = 0;
+        }
+        want_x += dx;
+        want_z += dz;
+
+        if ((i + 1) % RE4COOP_PAD_HZ == 0) {
+            float nowx = re4_bits_to_float(re4_field_bits(obj, offx));
+            LOGF("   t=%ds stick lx=%d ly=%d real_x=%.1f queria_x=%.1f desvio_x=%.1f",
+                 (i + 1) / RE4COOP_PAD_HZ, lx, ly, nowx - start_x, want_x,
+                 (nowx - start_x) - want_x);
+            if (offz >= 0) {
+                float nowz = re4_bits_to_float(re4_field_bits(obj, offz));
+                LOGF(" real_z=%.1f queria_z=%.1f desvio_z=%.1f",
+                     nowz - start_z, want_z, (nowz - start_z) - want_z);
+            }
+            LOGF(" sin_copias=%d sin_lectura=%d", misses, fails);
+            re4_log_float(" giro(+0xb0)", re4_bits_to_float(re4_field_bits(obj, 0xb0)));
+            LOGF("\n");
+            log_flush();
+        }
+        re4_usleep(1000000u / (unsigned int)RE4COOP_PAD_HZ);
+    }
+
+    re4_log_float("x_final", re4_bits_to_float(re4_field_bits(obj, offx)));
+    if (offz >= 0) {
+        re4_log_float("z_final", re4_bits_to_float(re4_field_bits(obj, offz)));
+    }
+    if (parts) {
+        re4_log_parts(parts, "final");
+    }
+    LOGF("\n");
+    log_flush();
 }
 
    // "foto" de los objetos
@@ -1095,7 +1392,7 @@ static void *re4_scan_thread(void *arg) {
 
     g_probe_fd = re4_open(RE4COOP_PROBE_PATH, RE4_O_WRONLY | RE4_O_CREAT | RE4_O_TRUNC, 0777);
     log_open(RE4COOP_SCAN_PATH);
-    LOGF("==== re4coop v" RE4COOP_VER_STR " deteccion de movimiento ====\nbuild: %s\nprobe_fd=%d scan_fd=%d\n",
+    LOGF("==== re4coop v" RE4COOP_VER_STR " movimiento + mando 2 ====\nbuild: %s\nprobe_fd=%d scan_fd=%d\n",
          BUILD_ID, g_probe_fd, g_fd);
     log_flush();
 
@@ -1169,9 +1466,32 @@ static void *re4_scan_thread(void *arg) {
         parts = re4_find_parts(leon_obj, best.off);
         LOGF("\n== cParts (el nodo que se dibuja): 0x%llx ==\n", (unsigned long long)parts);
         log_flush();
-        re4_walk(leon_obj, best.off, parts, "hacia delante", +1, 10);
-        re4_walk(leon_obj, best.off, parts, "hacia atras", -1, 12);
-        notify_step(13, "fin: mira donde quedo Leon y copia re4coop_scan.txt");
+        LOGF("   campo x=+0x%x campo z=+0x%x\n", best.off, second.valid ? second.off : -1);
+        log_flush();
+
+        int npads = re4_pad_open_all();
+        int slot = -1;
+        if (npads > 0) {
+            slot = re4_pad_probe(10, 8);
+        } else {
+            LOGF("\n== sin mandos: no puedo probar el mando 2 ==\n");
+            log_flush();
+        }
+        if (slot >= 0) {
+            char m2[120];
+            snprintf(m2, sizeof(m2), "mando 2 en handle %d. Ahora lo mueves tu", g_pad_handle[slot]);
+            notify_step(11, m2);
+            re4_pad_drive(leon_obj, best.off, second.valid ? second.off : -1, parts, slot, 12);
+            if (g_pad_close != NULL) {
+                for (int k = 0; k < g_pad_n; k++) {
+                    g_pad_close(g_pad_handle[k]);
+                }
+            }
+            notify_step(13, "fin: mira donde quedo Leon y copia re4coop_scan.txt");
+        } else {
+            notify_step(11, "no vi el mando 2: queda anotado en el log");
+            re4_sleep(2);
+        }
     } else {
         notify_step(10, "sin candidato claro: no escribo nada, solo queda el volcado");
         re4_sleep(2);
@@ -1232,6 +1552,12 @@ int32_t attr_public plugin_load(int32_t argc, const char* argv[]) {
             LOGF(" | 0x%llx+0x%x p%d", (unsigned long long)(uintptr_t)mi.seg[k].address, (unsigned int)mi.seg[k].size, (int)mi.seg[k].prot);
         }
         LOGF("\n");
+        if (re4_contains(mi.name, "libScePad")) {
+            g_mod_pad = handles[i];
+        }
+        if (re4_contains(mi.name, "libSceUserService")) {
+            g_mod_user = handles[i];
+        }
         if (i == 0) {
             main_info = mi;
             main_ok = 1;
