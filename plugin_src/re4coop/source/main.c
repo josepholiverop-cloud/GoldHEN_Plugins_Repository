@@ -7,11 +7,11 @@
 attr_public const char *g_pluginName = "re4coop";
 attr_public const char *g_pluginDesc = "RE4 coop - reconocimiento";
 attr_public const char *g_pluginAuth = "re4coop";
-attr_public uint32_t g_pluginVersion = 0x0000010b; // 1.11
+attr_public uint32_t g_pluginVersion = 0x0000010c; // 1.12
 
 // Version en texto: sale en CADA mensaje de pantalla y en la cabecera de los logs.
 // Ojo: si cambias la version, cambia tambien el numero de arriba. Nada mas.
-#define RE4COOP_VER_STR "1.11"
+#define RE4COOP_VER_STR "1.12"
 
 // Archivos de salida: los copias de la PS4 a la PC y me los pasas.
 #ifndef RE4COOP_LOG_PATH
@@ -24,7 +24,7 @@ attr_public uint32_t g_pluginVersion = 0x0000010b; // 1.11
 #define RE4COOP_PROBE_PATH "/data/GoldHEN/re4coop_probe.tmp"  // archivo auxiliar, se puede borrar
 #endif
 #ifndef RE4COOP_FIRST_SCAN_SECS
-#define RE4COOP_FIRST_SCAN_SECS 150                           // espera antes del primer escaneo
+#define RE4COOP_FIRST_SCAN_SECS 60                            // espera antes del primer escaneo
 #endif
 
 // Identifica esta compilacion (fecha y hora en que GitHub la hizo).
@@ -876,20 +876,23 @@ typedef int (*Re4PadInit)(void);
 typedef int (*Re4PadOpen)(int user_id, int type, int index, const void *param);
 typedef int (*Re4PadReadState)(int handle, void *data);
 typedef int (*Re4PadClose)(int handle);
+typedef int (*Re4PadGetHandle)(int user_id, int type, int index);
 typedef int (*Re4UserInitial)(int *user_id);
 
 static Re4PadInit      g_pad_init;
 static Re4PadOpen      g_pad_open;
 static Re4PadReadState g_pad_read;
 static Re4PadClose     g_pad_close;
+static Re4PadGetHandle g_pad_gethandle;
 
 // Handles de los modulos que el juego ya tiene cargados (los rellena plugin_load).
 static int g_mod_pad = -1;
 static int g_mod_user = -1;
 
-#define RE4_PAD_MAX 6
+#define RE4_PAD_MAX 10
 static int g_pad_handle[RE4_PAD_MAX];
 static int g_pad_which[RE4_PAD_MAX];   // indice del mando dentro de la cuenta
+static int g_pad_owned[RE4_PAD_MAX];   // 1 = lo abrio el plugin (hay que cerrarlo)
 static int g_pad_n;
 
 // El informe del mando se lee crudo y se interpreta por offsets, para no depender de
@@ -959,6 +962,14 @@ static int re4_pad_resolve(void) {
         LOGF("   scePadClose: 0x%08X\n", (unsigned int)r);
     }
 
+    fn = NULL;
+    r = re4_dlsym(h, "scePadGetHandle", &fn);
+    if (r == 0 && fn != NULL) {
+        g_pad_gethandle = (Re4PadGetHandle)(uintptr_t)fn;
+    } else {
+        LOGF("   scePadGetHandle: 0x%08X\n", (unsigned int)r);
+    }
+
     if (g_pad_open == NULL || g_pad_read == NULL) {
         LOGF("   sin funciones del mando: no puedo seguir\n");
         return -1;
@@ -985,38 +996,105 @@ static int re4_pad_user(void) {
     return user;
 }
 
-static void re4_pad_add(int handle, int which) {
+static void re4_pad_add(int handle, int which, int owned) {
     if (handle < 0 || g_pad_n >= RE4_PAD_MAX) {
         return;
     }
     g_pad_handle[g_pad_n] = handle;
     g_pad_which[g_pad_n] = which;
+    g_pad_owned[g_pad_n] = owned;
     g_pad_n++;
 }
 
-// Abre todos los mandos que se dejen: indices 0..3 de la cuenta de siempre y, por si el
-// segundo mando esta en otra cuenta, indices 0..1 de la siguiente.
+// Un intento con una cuenta y un indice. Primero pregunta si ese mando YA esta abierto
+// (el que usa el juego lo esta, y abrirlo otra vez da error) y, si no, lo abre el plugin.
+// verbose=0 en los reintentos: solo se anota lo que sale bien, para no llenar el log.
+static int re4_pad_try_one(int user, int idx, unsigned char *prm, int verbose) {
+    if (g_pad_n >= RE4_PAD_MAX) {
+        return 0;
+    }
+    int h = -1;
+    if (g_pad_gethandle != NULL) {
+        h = g_pad_gethandle(user, 0, idx);
+    }
+    if (h >= 0) {
+        for (int j = 0; j < g_pad_n; j++) {
+            if (g_pad_handle[j] == h) {
+                return 0;
+            }
+        }
+        LOGF("   GetHandle(cuenta=0x%x, idx=%d) = %d (ya estaba abierto)\n", user, idx, h);
+        re4_pad_add(h, idx, 0);
+        return 1;
+    }
+    int r = g_pad_open(user, 0, idx, prm);
+    if (r >= 0) {
+        for (int j = 0; j < g_pad_n; j++) {
+            if (g_pad_handle[j] == r) {
+                return 0;
+            }
+        }
+        LOGF("   Open(cuenta=0x%x, idx=%d) = %d (lo abri yo)\n", user, idx, r);
+        re4_pad_add(r, idx, 1);
+        return 1;
+    }
+    if (verbose) {
+        LOGF("   cuenta=0x%x idx=%d: GetHandle=-1, Open=0x%08X\n", user, idx, (unsigned int)r);
+    }
+    return 0;
+}
+
+// Barre las cuentas y los indices posibles. Devuelve cuantos mandos hay en la lista.
+static int re4_pad_scan(int verbose) {
+    unsigned char prm[16];
+    for (int k = 0; k < 16; k++) {
+        prm[k] = 0;
+    }
+    int base = re4_pad_user();
+    int users[8];
+    int nu = 0;
+    users[nu++] = base;
+    users[nu++] = base + 1;
+    users[nu++] = base + 2;
+    users[nu++] = base + 3;
+    int extra[4] = { 0x1000000, 0x1000001, 0x1000002, 0x1000003 };
+    for (int k = 0; k < 4; k++) {
+        int dup = 0;
+        for (int j = 0; j < nu; j++) {
+            if (users[j] == extra[k]) {
+                dup = 1;
+            }
+        }
+        if (!dup) {
+            users[nu++] = extra[k];
+        }
+    }
+    if (verbose) {
+        LOGF("   cuentas a probar:");
+        for (int j = 0; j < nu; j++) {
+            LOGF(" 0x%x", users[j]);
+        }
+        LOGF("\n");
+    }
+    for (int j = 0; j < nu; j++) {
+        for (int k = 0; k < 4; k++) {
+            re4_pad_try_one(users[j], k, prm, verbose);
+        }
+    }
+    return g_pad_n;
+}
+
 static int re4_pad_open_all(void) {
     g_pad_n = 0;
     LOGF("\n== mando 2: preparando libScePad (modulo=0x%x) ==\n", g_mod_pad);
     if (re4_pad_resolve() != 0) {
         return -1;
     }
-    int user = re4_pad_user();
-    LOGF("   userId=0x%x\n", user);
-    for (int k = 0; k < 4; k++) {
-        int h = g_pad_open(user, 0, k, NULL);
-        LOGF("   scePadOpen(user=0x%x, idx=%d) = %d\n", user, k, h);
-        re4_pad_add(h, k);
-    }
-    for (int k = 0; k < 2; k++) {
-        int h = g_pad_open(user + 1, 0, k, NULL);
-        LOGF("   scePadOpen(user=0x%x, idx=%d) = %d\n", user + 1, k, h);
-        re4_pad_add(h, k);
-    }
-    LOGF("   mandos abiertos: %d\n", g_pad_n);
+    LOGF("   userId=0x%x\n", re4_pad_user());
+    int n = re4_pad_scan(1);
+    LOGF("   mandos en la lista: %d\n", n);
     log_flush();
-    return g_pad_n;
+    return n;
 }
 
 static int re4_pad_read_one(int slot) {
@@ -1041,28 +1119,54 @@ static int re4_pad_stick(int v) {
     return d;
 }
 
-// Fase de sondeo: se queda 8 s mirando todos los mandos abiertos mientras tu mueves
-// SOLO el mando 2. El que se mueva, ese es.
+// Fase de sondeo: 8 s mirando todos los mandos de la lista mientras tu mueves SOLO el
+// mando 2. El que se mueva, ese es. La sonda corre SIEMPRE (aunque no haya ningun mando
+// abierto) y cada segundo vuelve a intentar abrir uno, por si enciendes el mando 2 ahora.
 static int re4_pad_probe(int step_no, int seconds) {
     notify_step(step_no, "SONDA: suelta el mando 1 y mueve SOLO el mando 2 (stick izq. en circulos)");
     re4_sleep(3);
+
+    int us = re4_usleep(1000);
+    int fast = (us == 0) ? 1 : 0;
+
     LOGF("\n== SONDEO DE MANDOS (%d s): mueve solo el mando 2 ==\n", seconds);
+    LOGF("   espera corta sceKernelUsleep(1000) = 0x%08X (%s)\n",
+         (unsigned int)us, fast ? "bien" : "falla: usare segundos");
+    LOGF("   mandos en la lista: %d\n", g_pad_n);
     log_flush();
 
     int activ[RE4_PAD_MAX];
     uint32_t prev_btn[RE4_PAD_MAX];
     int fails[RE4_PAD_MAX];
-    for (int j = 0; j < g_pad_n; j++) {
+    int known = 0;
+    for (int j = 0; j < RE4_PAD_MAX; j++) {
         activ[j] = 0;
         fails[j] = 0;
         prev_btn[j] = 0;
-        if (re4_pad_read_one(j) == 0) {
-            prev_btn[j] = (uint32_t)re4_rd32(g_pad_buf[j] + RE4_PAD_BTN);
-        }
     }
 
-    int ticks = seconds * 4;
+    int ticks = fast ? seconds * 4 : seconds;
     for (int t = 0; t < ticks; t++) {
+        int retry = fast ? ((t % 4) == 0) : 1;
+        if (retry && g_pad_n < RE4_PAD_MAX) {
+            int before = g_pad_n;
+            if (re4_pad_scan(0) != before) {
+                LOGF("   ahora hay %d mandos en la lista\n", g_pad_n);
+                log_flush();
+            }
+        }
+        if (g_pad_n > known) {
+            for (int j = known; j < g_pad_n; j++) {
+                activ[j] = 0;
+                fails[j] = 0;
+                prev_btn[j] = 0;
+                if (re4_pad_read_one(j) == 0) {
+                    prev_btn[j] = (uint32_t)re4_rd32(g_pad_buf[j] + RE4_PAD_BTN);
+                }
+            }
+            known = g_pad_n;
+        }
+
         for (int j = 0; j < g_pad_n; j++) {
             if (re4_pad_read_one(j) != 0) {
                 fails[j]++;
@@ -1081,8 +1185,13 @@ static int re4_pad_probe(int step_no, int seconds) {
             }
             activ[j] += m;
         }
-        if ((t % 4) == 3) {
-            LOGF("   t=%ds", (t + 1) / 4);
+
+        if ((t % 4) == 3 || !fast) {
+            int sec = fast ? ((t + 1) / 4) : (t + 1);
+            LOGF("   t=%ds", sec);
+            if (g_pad_n == 0) {
+                LOGF("  (ningun mando en la lista)");
+            }
             for (int j = 0; j < g_pad_n; j++) {
                 const unsigned char *d = g_pad_buf[j];
                 LOGF("  [h=%d idx=%d act=%d fallos=%d lx=%d ly=%d btn=%08x]",
@@ -1093,7 +1202,12 @@ static int re4_pad_probe(int step_no, int seconds) {
             LOGF("\n");
             log_flush();
         }
-        re4_usleep(250000);
+
+        if (fast) {
+            re4_usleep(250000);
+        } else {
+            re4_sleep(1);
+        }
     }
 
     int best = -1;
@@ -1105,7 +1219,11 @@ static int re4_pad_probe(int step_no, int seconds) {
         }
     }
     if (best < 0 || bestv < 400) {
-        LOGF("   elegido: ninguno (actividad maxima %d)\n", bestv);
+        LOGF("   elegido: ninguno (actividad maxima %d, mandos en la lista %d)\n", bestv, g_pad_n);
+        if (g_pad_n == 0) {
+            LOGF("   no hay ningun mando abierto: el mando 2 tiene que estar ENCENDIDO y con\n"
+                 "   sesion en esta consola. Pulsa su boton PS antes de la sonda.\n");
+        }
         log_flush();
         return -1;
     }
@@ -1147,6 +1265,11 @@ static void re4_pad_drive(uintptr_t obj, int offx, int offz, uintptr_t parts, in
     int fails = 0;
     int steps = RE4COOP_PAD_HZ * RE4COOP_PAD_SECS;
     float per_step = RE4COOP_PAD_SPEED / (float)RE4COOP_PAD_HZ;
+    int fast = (re4_usleep(1000) == 0) ? 1 : 0;
+    if (!fast) {
+        LOGF("   aviso: la espera corta no funciona; ire en golpes de 1 s\n");
+        log_flush();
+    }
 
     for (int i = 0; i < steps; i++) {
         int lx = 128;
@@ -1201,7 +1324,11 @@ static void re4_pad_drive(uintptr_t obj, int offx, int offz, uintptr_t parts, in
             LOGF("\n");
             log_flush();
         }
-        re4_usleep(1000000u / (unsigned int)RE4COOP_PAD_HZ);
+        if (fast) {
+            re4_usleep(1000000u / (unsigned int)RE4COOP_PAD_HZ);
+        } else if (((i + 1) % RE4COOP_PAD_HZ) == 0) {
+            re4_sleep(1);
+        }
     }
 
     re4_log_float("x_final", re4_bits_to_float(re4_field_bits(obj, offx)));
@@ -1470,13 +1597,9 @@ static void *re4_scan_thread(void *arg) {
         log_flush();
 
         int npads = re4_pad_open_all();
-        int slot = -1;
-        if (npads > 0) {
-            slot = re4_pad_probe(10, 8);
-        } else {
-            LOGF("\n== sin mandos: no puedo probar el mando 2 ==\n");
-            log_flush();
-        }
+        LOGF("\n== mandos abiertos: %d ==\n", npads);
+        log_flush();
+        int slot = re4_pad_probe(10, 8);   // corre siempre, aunque no haya mandos
         if (slot >= 0) {
             char m2[120];
             snprintf(m2, sizeof(m2), "mando 2 en handle %d. Ahora lo mueves tu", g_pad_handle[slot]);
@@ -1484,7 +1607,9 @@ static void *re4_scan_thread(void *arg) {
             re4_pad_drive(leon_obj, best.off, second.valid ? second.off : -1, parts, slot, 12);
             if (g_pad_close != NULL) {
                 for (int k = 0; k < g_pad_n; k++) {
-                    g_pad_close(g_pad_handle[k]);
+                    if (g_pad_owned[k]) {
+                        g_pad_close(g_pad_handle[k]);
+                    }
                 }
             }
             notify_step(13, "fin: mira donde quedo Leon y copia re4coop_scan.txt");
