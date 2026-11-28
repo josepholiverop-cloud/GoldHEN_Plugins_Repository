@@ -5,13 +5,13 @@
 #include "plugin_common.h"
 
 attr_public const char *g_pluginName = "re4coop";
-attr_public const char *g_pluginDesc = "RE4 coop - reconocimiento";
+attr_public const char *g_pluginDesc = "RE4 coop - sonda de camara";
 attr_public const char *g_pluginAuth = "re4coop";
-attr_public uint32_t g_pluginVersion = 0x0000010e; // 1.14
+attr_public uint32_t g_pluginVersion = 0x0000010f; // 1.15
 
 // Version en texto: sale en CADA mensaje de pantalla y en la cabecera de los logs.
 // Ojo: si cambias la version, cambia tambien el numero de arriba. Nada mas.
-#define RE4COOP_VER_STR "1.14"
+#define RE4COOP_VER_STR "1.15"
 
 // Archivos de salida: los copias de la PS4 a la PC y me los pasas.
 #ifndef RE4COOP_LOG_PATH
@@ -24,7 +24,7 @@ attr_public uint32_t g_pluginVersion = 0x0000010e; // 1.14
 #define RE4COOP_PROBE_PATH "/data/GoldHEN/re4coop_probe.tmp"  // archivo auxiliar, se puede borrar
 #endif
 #ifndef RE4COOP_FIRST_SCAN_SECS
-#define RE4COOP_FIRST_SCAN_SECS 60                            // espera antes del primer escaneo
+#define RE4COOP_FIRST_SCAN_SECS 40                            // espera antes de la primera foto (v1.15: 40 s)
 #endif
 
 // Identifica esta compilacion (fecha y hora en que GitHub la hizo).
@@ -669,26 +669,6 @@ static void re4_dump_full(uintptr_t obj, const char *label) {
     }
 }
 
-// Muestrea el objeto una vez por segundo mientras caminas: la coordenada que avanza
-// de forma continua es la posicion; un angulo o una matriz se queda practicamente igual.
-static void re4_trace(uintptr_t obj, int seconds) {
-    LOGF("\n== traza caminando (1 muestra por segundo, palabras +0x10..+0x48) ==\n");
-    for (int s = 0; s < seconds; s++) {
-        LOGF("T%02d", s);
-        for (int w = 2; w <= 9; w++) {
-            uint64_t v = re4_rd64((const unsigned char *)(uintptr_t)(obj + (uintptr_t)w * 8));
-            LOGF(" +%02x", w * 8);
-            re4_log_float("l", re4_bits_to_float((uint32_t)v));
-            re4_log_float("h", re4_bits_to_float((uint32_t)(v >> 32)));
-        }
-        LOGF("\n");
-        log_flush();
-        if (s + 1 < seconds) {
-            re4_sleep(1);
-        }
-    }
-}
-
 // Cual de los campos que cambiaron al caminar tiene mas pinta de coordenada.
 typedef struct {
     int off;      // byte dentro del objeto (-1 si no hay candidato)
@@ -1307,7 +1287,7 @@ static int re4_pad_probe(int step_no, int seconds) {
 
 #define RE4COOP_PAD_HZ    120
 #define RE4COOP_PAD_SPEED 1500.0f
-#define RE4COOP_PAD_SECS  15
+#define RE4COOP_PAD_SECS  8
 #define RE4COOP_PAD_DEAD  30
 
 // Mover a Leon con el stick izquierdo del mando 2, en empujones pequenos y continuos
@@ -1392,7 +1372,7 @@ static void re4_pad_drive(uintptr_t obj, int offx, int offz, uintptr_t parts, in
                      nowz - start_z, want_z, (nowz - start_z) - want_z);
             }
             LOGF(" sin_copias=%d sin_lectura=%d", misses, fails);
-            re4_log_float(" giro(+0xb0)", re4_bits_to_float(re4_field_bits(obj, 0xb0)));
+            re4_log_float(" giro(+0xb4)", re4_bits_to_float(re4_field_bits(obj, 0xb4)));
             LOGF("\n");
             log_flush();
         }
@@ -1415,6 +1395,253 @@ static void re4_pad_drive(uintptr_t obj, int offx, int offz, uintptr_t parts, in
 }
 
    // "foto" de los objetos
+
+// ---------------------------------------------------------------- camara (v1.15)
+//
+// Pantalla dividida = dos camaras. Antes de escribir nada hay que saber dos cosas:
+//   1) en que campo guarda el juego la posicion y el giro de la camara,
+//   2) que trozo del codigo del juego los lee (es lo que habria que enganchar para
+//      dibujar la escena dos veces, una por cada mitad de la pantalla).
+// Esta version mide las dos cosas en un solo pase: una traza compacta de los campos
+// de la camara que cambian, y una busqueda en el codigo de quien usa esos datos.
+
+#define CAM_MAX    10
+#define CAM_BYTES  0x140
+#define CAM_LINES  40
+
+static uintptr_t g_cam_slot[CAM_MAX];
+static uintptr_t g_cam_obj[CAM_MAX];
+static int g_cam_n;
+static unsigned char g_cam_a[CAM_MAX * CAM_BYTES];   // al empezar a caminar
+static unsigned char g_cam_b[CAM_MAX * CAM_BYTES];   // segundo anterior
+static unsigned char g_cam_c[CAM_MAX * CAM_BYTES];   // al dejar de caminar
+
+// Los objetos de la camara viven todos juntos en los datos del juego. En la v1.14
+// el bloque estaba en 0x147bc00; se busca por ese margen relativo a la base para
+// que siga valiendo aunque la consola cargue el juego en otra direccion.
+#define RE4_CAM_BLOCK_LO 0x107bc00u
+#define RE4_CAM_BLOCK_HI 0x107c400u
+
+static int re4_cam_collect(void) {
+    g_cam_n = 0;
+    uintptr_t lo = g_base + RE4_CAM_BLOCK_LO;
+    uintptr_t hi = g_base + RE4_CAM_BLOCK_HI;
+    for (int i = 0; i < g_ndet && g_cam_n < CAM_MAX; i++) {
+        const DetEnt *d = &g_det[i];
+        if (d->slot < lo || d->slot >= hi) {
+            continue;
+        }
+        if (!re4_readable((uint64_t)d->obj, CAM_BYTES)) {
+            continue;
+        }
+        g_cam_slot[g_cam_n] = d->slot;
+        g_cam_obj[g_cam_n] = d->obj;
+        g_cam_n++;
+    }
+    if (g_cam_n == 0) {
+        int c = re4_find_cam();
+        if (c >= 0) {
+            g_cam_slot[0] = g_det[c].slot;
+            g_cam_obj[0] = g_det[c].obj;
+            g_cam_n = 1;
+        }
+    }
+    return g_cam_n;
+}
+
+static void re4_cam_snap(unsigned char *dst) {
+    for (int c = 0; c < g_cam_n; c++) {
+        const unsigned char *p = (const unsigned char *)(uintptr_t)g_cam_obj[c];
+        unsigned char *d = dst + (size_t)c * CAM_BYTES;
+        for (int k = 0; k < CAM_BYTES; k++) {
+            d[k] = p[k];
+        }
+    }
+}
+
+static uint32_t re4_cam_img_bits(const unsigned char *img, int c, int off) {
+    const unsigned char *p = img + (size_t)c * CAM_BYTES + (size_t)off;
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+// Solo escribe lo que cambio: si un campo se mueve al caminar es una posicion; si se
+// mueve al girar la camara es el giro. Con eso se localiza todo sin adivinar.
+static void re4_cam_diff(const unsigned char *base, const char *label) {
+    LOGF("== %s ==\n", label);
+    for (int c = 0; c < g_cam_n; c++) {
+        int shown = 0;
+        for (int off = 0; off + 4 <= CAM_BYTES; off += 4) {
+            uint32_t a = re4_cam_img_bits(base, c, off);
+            uint32_t n = re4_field_bits(g_cam_obj[c], off);
+            if (a == n || shown >= CAM_LINES) {
+                continue;
+            }
+            shown++;
+            LOGF("   c%d +%03x %08x -> %08x", c, off, (unsigned int)a, (unsigned int)n);
+            re4_log_float("antes", re4_bits_to_float(a));
+            re4_log_float("ahora", re4_bits_to_float(n));
+            LOGF("\n");
+        }
+        if (shown == 0) {
+            LOGF("   c%d slot=0x%llx: sin cambios\n", c, (unsigned long long)g_cam_slot[c]);
+        }
+    }
+    log_flush();
+}
+
+typedef struct {
+    int cam;
+    int off;
+    float value;
+    float delta;
+    float ad;
+} CamMove;
+
+// Los 3 campos que mas se movieron al caminar y que tienen pinta de coordenada
+// (cientos o miles de unidades), descartando los que son angulos o factores.
+static int re4_cam_movers(CamMove *out, int max) {
+    int n = 0;
+    for (int c = 0; c < g_cam_n; c++) {
+        for (int off = 0; off + 4 <= CAM_BYTES; off += 4) {
+            uint32_t ba = re4_cam_img_bits(g_cam_a, c, off);
+            uint32_t bc = re4_cam_img_bits(g_cam_c, c, off);
+            if (ba == bc) {
+                continue;
+            }
+            float fa = re4_bits_to_float(ba);
+            float fc = re4_bits_to_float(bc);
+            if (!(fa > -100000.0f && fa < 100000.0f) || !(fc > -100000.0f && fc < 100000.0f)) {
+                continue;
+            }
+            if (!(fa > 50.0f || fa < -50.0f)) {
+                continue;
+            }
+            float d = fc - fa;
+            float ad = d < 0.0f ? -d : d;
+            if (ad < 20.0f) {
+                continue;
+            }
+            CamMove nw;
+            nw.cam = c;
+            nw.off = off;
+            nw.value = fc;
+            nw.delta = d;
+            nw.ad = ad;
+            int dup = 0;
+            for (int k = 0; k < n; k++) {
+                if (re4_float_to_bits(out[k].value) == re4_float_to_bits(fc)) {
+                    dup = 1;
+                }
+            }
+            if (dup) {
+                continue;
+            }
+            int pos = n < max ? n : max - 1;
+            while (pos > 0 && out[pos - 1].ad < ad) {
+                pos--;
+            }
+            for (int k = (n < max ? n : max - 1); k > pos; k--) {
+                out[k] = out[k - 1];
+            }
+            out[pos] = nw;
+            if (n < max) {
+                n++;
+            }
+        }
+    }
+    return n;
+}
+
+// El empujon: suma 300 unidades al campo, espera 2 s y lo deja como estaba. Si la
+// imagen se va y vuelve, ese campo es la camara y ya la controlamos (opcion 2).
+static void re4_cam_nudge(int step_no) {
+    CamMove mv[3];
+    int n = re4_cam_movers(mv, 3);
+    LOGF("\n== empujon de camara: %d campo(s) candidato(s) ==\n", n);
+    log_flush();
+    if (n == 0) {
+        LOGF("   ninguno: al caminar no se movio ningun campo con pinta de posicion\n");
+        log_flush();
+        return;
+    }
+    notify_step(step_no, "QUIETO 12 s: muevo la camara 2 s y la devuelvo (3 veces)");
+    re4_sleep(2);
+    for (int i = 0; i < n; i++) {
+        uintptr_t obj = g_cam_obj[mv[i].cam];
+        uint32_t bits = re4_field_bits(obj, mv[i].off);
+        LOGF("   prueba %d: c%d obj=0x%llx campo=+0x%x", i + 1, mv[i].cam,
+             (unsigned long long)obj, mv[i].off);
+        re4_log_float("valor", re4_bits_to_float(bits));
+        LOGF(" empujo 300\n");
+        log_flush();
+        int hits = re4_patch_delta(obj, bits, 300.0f);
+        LOGF("      copias escritas=%d, esperando 2 s\n", hits);
+        log_flush();
+        re4_sleep(2);
+        uint32_t now = re4_field_bits(obj, mv[i].off);
+        LOGF("      ahora");
+        re4_log_float("cam", re4_bits_to_float(now));
+        if (now == re4_float_to_bits(re4_bits_to_float(bits) + 300.0f)) {
+            LOGF(" -> sigue donde lo puse: lo devuelvo\n");
+            re4_patch_delta(obj, now, -300.0f);
+        } else {
+            LOGF(" -> el juego lo reescribio: no toco nada (buena senal)\n");
+        }
+        log_flush();
+        re4_sleep(1);
+    }
+}
+
+// Busca en el codigo del juego quien usa una direccion concreta. Son las tres formas
+// normales de cargar un dato global: lea reg,[rip+X], mov reg,[rip+X] y mov reg,dir64.
+// Cada acierto se anota como desplazamiento desde la base, junto con los 12 bytes
+// anteriores (asi se ve si empieza una funcion justo ahi: 55 48 89 e5 ...).
+static void re4_find_refs(uintptr_t target, const char *label) {
+    int hits = 0;
+    int shown = 0;
+    LOGF("== codigo que usa %s (0x%llx) ==\n", label, (unsigned long long)target);
+    for (int s = 0; s < g_nseg; s++) {
+        if (!(g_seg[s].prot & 4)) {
+            continue;
+        }
+        const unsigned char *b = g_seg[s].p;
+        size_t n = g_seg[s].n;
+        for (size_t off = 0; off + 10 <= n; off++) {
+            const char *kind = NULL;
+            if ((b[off] == 0x48 || b[off] == 0x4C) && (b[off + 1] == 0x8D || b[off + 1] == 0x8B) &&
+                (b[off + 2] & 0xC7) == 0x05) {
+                uintptr_t t = (uintptr_t)(b + off + 7) + (intptr_t)re4_rd32(b + off + 3);
+                if (t == target) {
+                    kind = (b[off + 1] == 0x8D) ? "lea" : "mov";
+                }
+            }
+            if (kind == NULL && b[off] == 0x48 && b[off + 1] >= 0xB8 && b[off + 1] <= 0xBF) {
+                if ((uintptr_t)re4_rd64(b + off + 2) == target) {
+                    kind = "mov64";
+                }
+            }
+            if (kind == NULL) {
+                continue;
+            }
+            hits++;
+            if (shown >= 12) {
+                continue;
+            }
+            shown++;
+            LOGF("   +0x%llx %s", (unsigned long long)((uintptr_t)(b + off) - g_base), kind);
+            if (off >= 12) {
+                LOGF(" (antes:");
+                for (size_t k = off - 12; k < off; k++) {
+                    LOGF(" %02x", (unsigned int)b[k]);
+                }
+                LOGF(")");
+            }
+            LOGF("\n");
+        }
+    }
+    LOGF("   total %d\n", hits);
+    log_flush();
+}
 
 static int re4_det_want(const char *nm) {
     return re4_contains(nm, "cPl") || re4_contains(nm, "Player") ||
@@ -1585,25 +1812,35 @@ static int re4_det_report(const char *label) {
     return moved;
 }
 
-// Hilo aparte: espera a que estes jugando y hace tres fases guiadas por mensajes.
+// Hilo aparte: mide la camara y el codigo que la usa (v1.15).
 static void *re4_scan_thread(void *arg) {
     (void)arg;
 
     g_probe_fd = re4_open(RE4COOP_PROBE_PATH, RE4_O_WRONLY | RE4_O_CREAT | RE4_O_TRUNC, 0777);
     log_open(RE4COOP_SCAN_PATH);
-    LOGF("==== re4coop v" RE4COOP_VER_STR " movimiento + mando 2 ====\nbuild: %s\nprobe_fd=%d scan_fd=%d\n",
+    LOGF("==== re4coop v" RE4COOP_VER_STR " sonda de camara + codigo ====\nbuild: %s\nprobe_fd=%d scan_fd=%d\n",
          BUILD_ID, g_probe_fd, g_fd);
     log_flush();
 
+    notify_step(7, "entra a tu partida: empiezo en cuanto te vea");
     re4_sleep(RE4COOP_FIRST_SCAN_SECS);
 
-    // Fase 1: foto de todo, y retrato a fondo de Leon (que ya sabemos quien es).
-    notify_step(7, "QUIETO AHORA: no muevas a Leon. Sacando la foto...");
-    re4_det_collect();
+    // Foto de todos los objetos vivos. Si todavia no estas jugando, se repite.
+    int leon = -1;
+    for (int tries = 0; tries < 4; tries++) {
+        re4_det_collect();
+        leon = re4_find_leon();
+        if (leon >= 0) {
+            break;
+        }
+        LOGF("== intento %d: todavia no hay partida cargada ==\n", tries + 1);
+        log_flush();
+        notify_step(7, "no te veo todavia: sigo esperando 10 s mas");
+        re4_sleep(10);
+    }
     re4_det_list();
     log_flush();
 
-    int leon = re4_find_leon();
     uintptr_t leon_obj = 0;
     unsigned char leon_img[DET_BYTES];
     for (int k = 0; k < DET_BYTES; k++) {
@@ -1620,30 +1857,32 @@ static void *re4_scan_thread(void *arg) {
         }
         re4_dump_full(leon_obj, "LEON quieto");
     } else {
-        LOGF("\n== LEON: no encontrado (ninguna clase sin nombre con 23 funciones) ==\n");
+        LOGF("\n== LEON: no encontrado: no podre medir el movimiento ==\n");
     }
 
-    int cam = re4_find_cam();
-    if (cam >= 0) {
-        LOGF("\n== CAMARA: candidato C%03d slot=0x%llx obj=0x%llx vt=0x%llx (sin nombre, 3 funciones)\n",
-             cam, (unsigned long long)g_det[cam].slot, (unsigned long long)g_det[cam].obj,
-             (unsigned long long)g_det[cam].vt);
-        re4_dump_full((uintptr_t)g_det[cam].obj, "CAMARA quieta");
+    int ncam = re4_cam_collect();
+    LOGF("\n== CAMARA: %d objetos en el bloque de la camara ==\n", ncam);
+    for (int i = 0; i < ncam; i++) {
+        uint64_t vt = re4_rd64((const unsigned char *)(uintptr_t)g_cam_obj[i]);
+        LOGF("   c%d slot=0x%llx obj=0x%llx vt=0x%llx\n", i,
+             (unsigned long long)g_cam_slot[i], (unsigned long long)g_cam_obj[i],
+             (unsigned long long)vt);
+        re4_dump_full(g_cam_obj[i], "CAMARA");
     }
     log_flush();
 
-    notify_step(8, "AHORA camina recto y sin parar: cuento 12 s desde YA");
-    // Los avisos de pantalla se muestran con retraso (en la v1.06 el #9 salio a los
-    // pocos segundos y solo se midieron los 2 ultimos). Se espera un poco antes de
-    // medir para que los 12 segundos de caminata cuenten enteros.
+    // Fase 1: caminar. La camara sigue a Leon, asi que su posicion tambien se mueve.
+    notify_step(8, "AHORA camina recto y sin parar: cuento 10 s desde YA");
     re4_sleep(3);
-    if (leon >= 0) {
-        re4_trace(leon_obj, 12);
-    } else {
-        re4_sleep(12);
+    re4_cam_snap(g_cam_a);
+    re4_cam_snap(g_cam_b);
+    for (int s = 0; s < 10; s++) {
+        char lab[40];
+        snprintf(lab, sizeof(lab), "caminando T%02d", s);
+        re4_cam_diff(g_cam_b, lab);
+        re4_cam_snap(g_cam_b);
+        re4_sleep(1);
     }
-
-    notify_step(9, "midiendo movimiento...");
     re4_det_report("fase 1: caminaste");
     BestMove best;
     BestMove second;
@@ -1656,27 +1895,57 @@ static void *re4_scan_thread(void *arg) {
     if (leon >= 0) {
         best = re4_leon_moved(leon_obj, leon_img, &second);
         re4_dump_full(leon_obj, "LEON despues de caminar");
+        re4_log_float("giro(+0xb4)", re4_bits_to_float(re4_field_bits(leon_obj, 0xb4)));
+        LOGF("\n");
+    }
+    re4_cam_snap(g_cam_c);   // foto al dejar de caminar: sirve para el empujon
+    log_flush();
+
+    // Fase 2: girar la camara sin caminar. Aqui se ve el giro y no la posicion.
+    notify_step(9, "AHORA gira la camara con el STICK DERECHO: 8 s");
+    re4_sleep(3);
+    for (int s = 0; s < 8; s++) {
+        char lab[40];
+        snprintf(lab, sizeof(lab), "girando camara T%02d", s);
+        re4_cam_diff(g_cam_b, lab);
+        re4_cam_snap(g_cam_b);
+        re4_sleep(1);
     }
     log_flush();
 
-    // Las escrituras: un salto grande en cada eje horizontal y luego un deslizar.
+    // Fase 3: el empujon controlado.
+    re4_cam_nudge(10);
+
+    // Fase 4: quien usa esos datos en el codigo del juego.
+    LOGF("\n== QUIEN USA LA CAMARA EN EL CODIGO ==\n");
+    for (int i = 0; i < ncam && i < 4; i++) {
+        char lab[48];
+        snprintf(lab, sizeof(lab), "la ranura de la camara c%d", i);
+        re4_find_refs(g_cam_slot[i], lab);
+        snprintf(lab, sizeof(lab), "el objeto de la camara c%d", i);
+        re4_find_refs(g_cam_obj[i], lab);
+    }
+    if (leon >= 0) {
+        re4_find_refs(g_det[leon].slot, "la ranura de Leon");
+        re4_find_refs((uintptr_t)g_det[leon].vt, "la vtable de Leon");
+    }
+    log_flush();
+
+    // Fase 5: el mando 2, solo para confirmar que sigue funcionando igual.
     uintptr_t parts = 0;
     if (leon >= 0 && best.valid) {
         parts = re4_find_parts(leon_obj, best.off);
         LOGF("\n== cParts (el nodo que se dibuja): 0x%llx ==\n", (unsigned long long)parts);
         log_flush();
-        LOGF("   campo x=+0x%x campo z=+0x%x\n", best.off, second.valid ? second.off : -1);
-        log_flush();
-
         int npads = re4_pad_open_all();
         LOGF("\n== mandos abiertos: %d ==\n", npads);
         log_flush();
-        int slot = re4_pad_probe(10, 8);   // corre siempre, aunque no haya mandos
+        int slot = re4_pad_probe(11, 6);
         if (slot >= 0) {
             char m2[120];
             snprintf(m2, sizeof(m2), "mando 2 en handle %d. Ahora lo mueves tu", g_pad_handle[slot]);
-            notify_step(11, m2);
-            re4_pad_drive(leon_obj, best.off, second.valid ? second.off : -1, parts, slot, 12);
+            notify_step(12, m2);
+            re4_pad_drive(leon_obj, best.off, second.valid ? second.off : -1, parts, slot, 13);
             if (g_pad_close != NULL) {
                 for (int k = 0; k < g_pad_n; k++) {
                     if (g_pad_owned[k]) {
@@ -1684,14 +1953,10 @@ static void *re4_scan_thread(void *arg) {
                     }
                 }
             }
-            notify_step(13, "fin: mira donde quedo Leon y copia re4coop_scan.txt");
         } else {
-            notify_step(11, "no vi el mando 2: queda anotado en el log");
+            notify_step(12, "no vi el mando 2: queda anotado en el log");
             re4_sleep(2);
         }
-    } else {
-        notify_step(10, "sin candidato claro: no escribo nada, solo queda el volcado");
-        re4_sleep(2);
     }
 
     log_close();
@@ -1699,7 +1964,7 @@ static void *re4_scan_thread(void *arg) {
         re4_close(g_probe_fd);
         g_probe_fd = -1;
     }
-    notify_step(14, "escaneo terminado. Copia re4coop_scan.txt");
+    notify_step(14, "terminado. Copia re4coop_scan.txt y re4coop_log.txt");
     return NULL;
 }
 
