@@ -7,11 +7,11 @@
 attr_public const char *g_pluginName = "re4coop";
 attr_public const char *g_pluginDesc = "RE4 coop - reconocimiento";
 attr_public const char *g_pluginAuth = "re4coop";
-attr_public uint32_t g_pluginVersion = 0x0000010d; // 1.13
+attr_public uint32_t g_pluginVersion = 0x0000010e; // 1.14
 
 // Version en texto: sale en CADA mensaje de pantalla y en la cabecera de los logs.
 // Ojo: si cambias la version, cambia tambien el numero de arriba. Nada mas.
-#define RE4COOP_VER_STR "1.13"
+#define RE4COOP_VER_STR "1.14"
 
 // Archivos de salida: los copias de la PS4 a la PC y me los pasas.
 #ifndef RE4COOP_LOG_PATH
@@ -1362,7 +1362,7 @@ static void re4_pad_drive(uintptr_t obj, int offx, int offz, uintptr_t parts, in
             dx = ((float)ax / 127.0f) * per_step;
         }
         if (ay > RE4COOP_PAD_DEAD || ay < -RE4COOP_PAD_DEAD) {
-            dz = -((float)ay / 127.0f) * per_step;   // arriba = adelante
+            dz = ((float)ay / 127.0f) * per_step;    // v1.14: arriba y abajo al derecho
         }
         if (dx != 0.0f) {
             uint32_t cur = re4_field_bits(obj, offx);
