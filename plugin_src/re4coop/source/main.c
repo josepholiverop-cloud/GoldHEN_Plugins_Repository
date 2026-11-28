@@ -7,11 +7,11 @@
 attr_public const char *g_pluginName = "re4coop";
 attr_public const char *g_pluginDesc = "RE4 coop - reconocimiento";
 attr_public const char *g_pluginAuth = "re4coop";
-attr_public uint32_t g_pluginVersion = 0x0000010c; // 1.12
+attr_public uint32_t g_pluginVersion = 0x0000010d; // 1.13
 
 // Version en texto: sale en CADA mensaje de pantalla y en la cabecera de los logs.
 // Ojo: si cambias la version, cambia tambien el numero de arriba. Nada mas.
-#define RE4COOP_VER_STR "1.12"
+#define RE4COOP_VER_STR "1.13"
 
 // Archivos de salida: los copias de la PS4 a la PC y me los pasas.
 #ifndef RE4COOP_LOG_PATH
@@ -889,10 +889,11 @@ static Re4PadGetHandle g_pad_gethandle;
 static int g_mod_pad = -1;
 static int g_mod_user = -1;
 
-#define RE4_PAD_MAX 10
+#define RE4_PAD_MAX 16
 static int g_pad_handle[RE4_PAD_MAX];
 static int g_pad_which[RE4_PAD_MAX];   // indice del mando dentro de la cuenta
 static int g_pad_owned[RE4_PAD_MAX];   // 1 = lo abrio el plugin (hay que cerrarlo)
+static int g_pad_user[RE4_PAD_MAX];    // cuenta de la consola (usuario o invitado) del mando
 static int g_pad_n;
 
 // El informe del mando se lee crudo y se interpreta por offsets, para no depender de
@@ -996,13 +997,70 @@ static int re4_pad_user(void) {
     return user;
 }
 
-static void re4_pad_add(int handle, int which, int owned) {
+// Lista de cuentas con sesion abierta en la consola. Es lo que hace falta desde la v1.13:
+// la PS4 no deja dos mandos en el mismo usuario (apaga el segundo), asi que el mando 2 va
+// en otra cuenta o en el invitado, y hay que abrirlo con ESA cuenta, no con la del juego.
+// La funcion rellena 4 enteros y -1 significa hueco vacio. Devuelve cuantas cuentas hay
+// (-1 si esa funcion no existe en esta consola).
+static int re4_pad_login_users(int *out, int max) {
+    if (g_mod_user < 0 || out == NULL || max <= 0) {
+        return -1;
+    }
+    void *fn = NULL;
+    if (re4_dlsym(g_mod_user, "sceUserServiceGetLoginUserIdList", &fn) != 0 || fn == NULL) {
+        LOGF("   lista de cuentas: esa funcion no esta en libSceUserService\n");
+        return -1;
+    }
+    typedef int (*Re4UserList)(void *);
+    Re4UserList get = (Re4UserList)(uintptr_t)fn;
+    unsigned char raw[0x20];
+    for (int k = 0; k < 0x20; k++) {
+        raw[k] = 0;
+    }
+    int r = get(raw);
+    if (r != 0) {
+        LOGF("   lista de cuentas: 0x%08X (pruebo a inicializar el servicio)\n", (unsigned int)r);
+        void *ini = NULL;
+        if (re4_dlsym(g_mod_user, "sceUserServiceInitialize", &ini) == 0 && ini != NULL) {
+            typedef int (*Re4UserInit)(const void *);
+            Re4UserInit init = (Re4UserInit)(uintptr_t)ini;
+            LOGF("   sceUserServiceInitialize = 0x%08X\n", (unsigned int)init(NULL));
+            r = get(raw);
+        }
+    }
+    if (r != 0) {
+        LOGF("   lista de cuentas: 0x%08X (fallo, sigo con lo que haya)\n", (unsigned int)r);
+    }
+    LOGF("   cuentas con sesion:");
+    int n = 0;
+    for (int j = 0; j < 4; j++) {
+        int v = 0;
+        __builtin_memcpy(&v, raw + j * 4, 4);
+        LOGF(" 0x%x", v);
+        if (v != 0 && v != -1 && n < max) {
+            int dup = 0;
+            for (int k = 0; k < n; k++) {
+                if (out[k] == v) {
+                    dup = 1;
+                }
+            }
+            if (!dup) {
+                out[n++] = v;
+            }
+        }
+    }
+    LOGF("\n");
+    return n;
+}
+
+static void re4_pad_add(int handle, int which, int owned, int user) {
     if (handle < 0 || g_pad_n >= RE4_PAD_MAX) {
         return;
     }
     g_pad_handle[g_pad_n] = handle;
     g_pad_which[g_pad_n] = which;
     g_pad_owned[g_pad_n] = owned;
+    g_pad_user[g_pad_n] = user;
     g_pad_n++;
 }
 
@@ -1024,7 +1082,7 @@ static int re4_pad_try_one(int user, int idx, unsigned char *prm, int verbose) {
             }
         }
         LOGF("   GetHandle(cuenta=0x%x, idx=%d) = %d (ya estaba abierto)\n", user, idx, h);
-        re4_pad_add(h, idx, 0);
+        re4_pad_add(h, idx, 0, user);
         return 1;
     }
     int r = g_pad_open(user, 0, idx, prm);
@@ -1035,7 +1093,7 @@ static int re4_pad_try_one(int user, int idx, unsigned char *prm, int verbose) {
             }
         }
         LOGF("   Open(cuenta=0x%x, idx=%d) = %d (lo abri yo)\n", user, idx, r);
-        re4_pad_add(r, idx, 1);
+        re4_pad_add(r, idx, 1, user);
         return 1;
     }
     if (verbose) {
@@ -1044,31 +1102,43 @@ static int re4_pad_try_one(int user, int idx, unsigned char *prm, int verbose) {
     return 0;
 }
 
+static void re4_add_user(int *users, int *nu, int max, int v) {
+    if (v == 0 || v == -1 || *nu >= max) {
+        return;
+    }
+    for (int j = 0; j < *nu; j++) {
+        if (users[j] == v) {
+            return;
+        }
+    }
+    users[(*nu)++] = v;
+}
+
 // Barre las cuentas y los indices posibles. Devuelve cuantos mandos hay en la lista.
+// Primero las cuentas que la consola tiene con sesion ahora mismo (aqui entra el invitado,
+// que es donde suele ir el mando 2), despues la cuenta del juego y, por si acaso, unas
+// cuentas tipicas. Abrir una cuenta que no existe solo da error: no rompe nada.
 static int re4_pad_scan(int verbose) {
     unsigned char prm[16];
     for (int k = 0; k < 16; k++) {
         prm[k] = 0;
     }
-    int base = re4_pad_user();
-    int users[8];
+    int users[16];
     int nu = 0;
-    users[nu++] = base;
-    users[nu++] = base + 1;
-    users[nu++] = base + 2;
-    users[nu++] = base + 3;
-    int extra[4] = { 0x1000000, 0x1000001, 0x1000002, 0x1000003 };
-    for (int k = 0; k < 4; k++) {
-        int dup = 0;
-        for (int j = 0; j < nu; j++) {
-            if (users[j] == extra[k]) {
-                dup = 1;
-            }
-        }
-        if (!dup) {
-            users[nu++] = extra[k];
-        }
+    int logins[4];
+    int nl = re4_pad_login_users(logins, 4);
+    for (int k = 0; k < nl && k < 4; k++) {
+        re4_add_user(users, &nu, 16, logins[k]);
     }
+    int base = re4_pad_user();
+    re4_add_user(users, &nu, 16, base);
+    re4_add_user(users, &nu, 16, base + 1);
+    re4_add_user(users, &nu, 16, base + 2);
+    re4_add_user(users, &nu, 16, base + 3);
+    re4_add_user(users, &nu, 16, 0x1000000);
+    re4_add_user(users, &nu, 16, 0x1000001);
+    re4_add_user(users, &nu, 16, 0x1000002);
+    re4_add_user(users, &nu, 16, 0x1000003);
     if (verbose) {
         LOGF("   cuentas a probar:");
         for (int j = 0; j < nu; j++) {
@@ -1194,8 +1264,8 @@ static int re4_pad_probe(int step_no, int seconds) {
             }
             for (int j = 0; j < g_pad_n; j++) {
                 const unsigned char *d = g_pad_buf[j];
-                LOGF("  [h=%d idx=%d act=%d fallos=%d lx=%d ly=%d btn=%08x]",
-                     g_pad_handle[j], g_pad_which[j], activ[j], fails[j],
+                LOGF("  [u=0x%x h=%d idx=%d act=%d fallos=%d lx=%d ly=%d btn=%08x]",
+                     g_pad_user[j], g_pad_handle[j], g_pad_which[j], activ[j], fails[j],
                      (int)d[RE4_PAD_LX], (int)d[RE4_PAD_LY],
                      (unsigned int)re4_rd32(d + RE4_PAD_BTN));
             }
@@ -1221,14 +1291,16 @@ static int re4_pad_probe(int step_no, int seconds) {
     if (best < 0 || bestv < 400) {
         LOGF("   elegido: ninguno (actividad maxima %d, mandos en la lista %d)\n", bestv, g_pad_n);
         if (g_pad_n == 0) {
-            LOGF("   no hay ningun mando abierto: el mando 2 tiene que estar ENCENDIDO y con\n"
-                 "   sesion en esta consola. Pulsa su boton PS antes de la sonda.\n");
+            LOGF("   no hay ningun mando abierto. El mando 2 tiene que estar ENCENDIDO y con\n"
+                 "   sesion en OTRA cuenta o en el INVITADO (la PS4 apaga el segundo mando\n"
+                 "   si eliges el mismo usuario que el mando 1). Pulsa su boton PS antes de\n"
+                 "   la sonda y elige \"Jugador invitado\".\n");
         }
         log_flush();
         return -1;
     }
-    LOGF("   elegido: handle %d, indice %d, actividad %d\n",
-         g_pad_handle[best], g_pad_which[best], bestv);
+    LOGF("   elegido: cuenta 0x%x, handle %d, indice %d, actividad %d\n",
+         g_pad_user[best], g_pad_handle[best], g_pad_which[best], bestv);
     log_flush();
     return best;
 }
